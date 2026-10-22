@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>问卷工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/overrides.css?v=20261022-9">
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/">问卷工作台</a><div id="identity"></div></header>
+  <main id="app">
+  <section class="app-view auth-pane" id="authPane">
+    <div class="auth-copy"><span class="eyebrow">在线问卷系统</span><h1>创建与收集问卷</h1><p>登录后管理问卷、分发填写链接并查看统计。</p></div>
+    <form id="authForm" class="auth-form"><div class="tabs"><button type="button" class="tab active" data-mode="login">登录</button><button type="button" class="tab" data-mode="register">注册</button></div>
+      <label>用户名<input name="username" minlength="3" maxlength="64" required autocomplete="username"></label>
+      <label>密码<input name="password" type="password" minlength="8" required autocomplete="current-password"></label>
+      <button class="primary" type="submit" id="authSubmit">登录</button><p class="message" id="authMessage"></p>
+    </form>
+  </section>
+  <section class="app-view" id="dashboard" hidden>
+    <div class="page-heading"><div><span class="eyebrow">个人工作台</span><h1>我的问卷</h1></div><div class="button-row"><button class="quiet" id="casesToggle" type="button">功能验证</button><button class="primary" id="createToggle">＋ 新建问卷</button></div></div>
+    <section class="workspace case-panel" id="casePanel" hidden>
+      <div class="section-head"><div><h2>功能验证用例</h2><p class="muted">检查真实接口和填写页面。每项结果均提供可展开的输入、响应及断言证据；结束后自动清理验证数据。</p></div><button class="primary" id="runCases" type="button">运行验证</button></div>
+      <div id="caseResults" class="case-results"><p class="muted">尚未运行验证。</p></div>
+      <div id="caseBrowser" class="case-browser" aria-live="polite"></div>
+    </section>
+    <section id="builder" class="workspace" hidden>
+      <div class="section-head"><h2>问卷设置</h2><button class="quiet" id="builderClose">取消</button></div>
+      <form id="surveyForm">
+        <div class="form-grid"><label>问卷标题<input name="title" required maxlength="200" placeholder="例如：校园出行调查"></label><label>截止时间<input name="closesAt" type="datetime-local"></label></div>
+        <label>说明<textarea name="description" rows="2" placeholder="填写问卷说明"></textarea></label>
+        <div class="check-row"><label><input name="allowAnonymous" type="checkbox"> 匿名保存回答（不记录填写账号）</label><label><input name="allowMultipleResponses" type="checkbox"> 允许重复提交</label></div>
+        <div class="section-head"><h2>题目 <span id="questionCount" class="muted">0</span></h2><div class="button-row"><button type="button" class="quiet" data-add="single_choice">＋ 单选</button><button type="button" class="quiet" data-add="multiple_choice">＋ 多选</button><button type="button" class="quiet" data-add="fill">＋ 填空</button></div></div>
+        <div id="questionList" class="question-list"></div>
+        <div class="section-head"><h2>跳转规则</h2><button type="button" class="quiet" id="addRule">＋ 添加规则</button></div>
+        <div id="ruleList" class="rule-list"></div>
+        <div class="form-footer"><span class="muted">规则按优先级顺序匹配，未匹配时进入下一题。</span><button type="submit" class="primary" name="status" value="draft">保存草稿</button><button type="submit" class="primary publish" name="status" value="published">发布问卷</button></div>
+      </form>
+    </section>
+    <div id="surveyList" class="survey-list"></div>
+  </section>
+  <section class="app-view" id="filler" hidden></section>
+  <section class="app-view" id="results" hidden></section>
+  <div id="toast" role="status" class="toast" hidden></div>
+  </main>
+  <script src="/app.js?v=20261022-11"></script>
+</body>
+</html>
