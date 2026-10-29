@@ -1,35 +1,29 @@
-# 第一阶段提交包
+# 问卷系统第二阶段
 
-本目录包含问卷系统第一阶段代码、MongoDB 初始化脚本、运行配置样例、系统/API/数据库说明、流程与 AI 使用记录和测试脚本。
+这是基于第一阶段代码继续扩展的独立二阶段工程，包含题目库、题目版本、题目共享、题目使用查询、跨问卷统计和问卷库。
 
-## 运行
+## 启动
 
 环境要求：Node.js 20+、本地 MongoDB 7+。
 
-1. 复制 `.env.example` 为 `.env`，按需设置 MongoDB 地址、数据库名、端口和应用密钥。
-2. 在本目录运行 `npm.cmd ci`（macOS/Linux 使用 `npm ci`）。
-3. 运行 `npm.cmd run db:init` 初始化集合校验器和索引。
-4. 运行 `npm.cmd start`，打开 `http://localhost:3000`。
-5. 注册账号后，可在工作台创建、编辑、发布、手动关闭问卷、填写问卷和查看统计；“功能验证”可以运行可查看证据的端到端验证。
+```powershell
+Copy-Item .env.example .env
+npm.cmd install
+npm.cmd run db:init
+npm.cmd start
+```
 
-复现细节和 API 格式见 `docs/API.md`，数据库字段及关系见 `docs/STRUCT.md`。
+默认使用独立数据库 `questionnaire_system_phase2` 和端口 `3002`，访问 `http://localhost:3002`。不会使用第一阶段的业务数据库。
 
-## 命令
+## 验证
 
-- `npm.cmd run db:init`：幂等创建/更新 MongoDB validator 和索引，不清空数据。
-- `npm.cmd run verify`：运行 API 与业务逻辑验证，并自动清理验证数据；脚本使用当前 `.env` 指定的数据库，建议使用专用测试数据库。
-- `npm.cmd run db:reset`：清空六个业务集合。仅在明确需要复位时运行。
-- `npm.cmd start`：启动网页和 API 服务。
+```powershell
+npm.cmd run verify
+npm.cmd run verify:phase2
+```
 
-Windows PowerShell 下使用 `npm.cmd` 可避免执行策略拦截 `npm.ps1`；macOS/Linux 使用 `npm`。`.env`、`node_modules` 和 MongoDB 数据目录不包含在提交包中；按上述步骤即可从干净环境恢复运行。禁止重复填写时，匿名答卷仍不保存账号 ID，但服务端会保存按问卷作用域生成的不可逆去重键。
+第一条命令验证第一阶段兼容功能，第二条命令验证题目版本链、题库复用、问卷库模板复制、题目使用关系和跨问卷统计；这两条命令只清理各自创建的临时数据。工作台“功能验证”会创建名称带`测试用`前缀的问卷、题目、规则、答卷和题库，并保留数据供页面检查；完成后点击“一键删除测试数据”清理。
 
-## 文件清单
+## 项目文档
 
-- `server.js`：Node.js HTTP 服务与业务逻辑。
-- `public/`：前端页面、交互脚本和样式。
-- `db/init.js`：MongoDB 集合 validator 与索引。
-- `scripts/`：数据库复位和可重复验证脚本。
-- `docs/API.md`：运行、认证、API、规则和统计说明。
-- `docs/STRUCT.md`：集合字段、关系、示例、冗余、统计和扩展设计。
-- `docs/PROCESS.md`：需求追踪、设计决策、流程和验证记录。
-- `docs/AI_RICORD.md`：AI 使用过程记录。
+提交文档包括[系统说明](docs/系统说明.md)、[数据库设计](docs/数据库设计.md)、[API说明](docs/API说明.md)和[关键逻辑说明](docs/关键逻辑说明.md)。完整项目完成报告见[docs/实验报告.md](docs/实验报告.md)，AI使用过程见[docs/AI_RICORD.md](docs/AI_RICORD.md)。

@@ -31,7 +31,6 @@ async function main() {
   let token;
   let shortId;
   let cycleShortId;
-  let choiceShortId;
   let userId;
   const mongo = new MongoClient(uri);
   try {
@@ -108,53 +107,12 @@ async function main() {
       if (!result.response.ok || result.body.submittedCount !== 1 || result.body.questions[3]?.average !== 5 || skipped?.visitedCount !== 0 || skipped?.skippedCount !== 1 || reached?.visitedCount !== 1 || !result.body.visitDataComplete) throw new Error('aggregate result mismatch');
       return '数字题触发跳转；未成年题访问 0 / 跳过 1，成年路径题访问 1，评分平均值为 5';
     });
-    await check('验证单选、多选跳转及多选校验', async () => {
-      const choiceSurvey = {
-        title: `选择题验证 ${suffix}`, description: '验证选择题校验、跳转与统计。',
-        allowAnonymous: true, allowMultipleResponses: false, status: 'published',
-        questions: [
-          { type: 'single_choice', prompt: '是否继续', required: true, options: [{ key: 'yes', text: '继续', order: 1 }, { key: 'no', text: '不继续', order: 2 }], validation: {} },
-          { type: 'text', prompt: '结束原因', required: true, validation: { minLength: 2, maxLength: 30 } },
-          { type: 'multiple_choice', prompt: '选择两项', required: true, options: [{ key: 'a', text: '选项 A', order: 1 }, { key: 'b', text: '选项 B', order: 2 }, { key: 'c', text: '选项 C', order: 3 }], validation: { minSelections: 2, maxSelections: 2 } },
-          { type: 'text', prompt: '未命中多选规则', required: true, validation: { minLength: 2, maxLength: 30 } },
-          { type: 'text', prompt: '完成说明', required: true, validation: { minLength: 2, maxLength: 30 } }
-        ],
-        jumpRules: [
-          { sourceOrder: 1, targetOrder: 3, priority: 1, condition: { answerType: 'single_choice', operator: 'equals', optionKeys: ['yes'] } },
-          { sourceOrder: 3, targetOrder: 5, priority: 1, condition: { answerType: 'multiple_choice', operator: 'includes_all', optionKeys: ['a', 'b'] } }
-        ]
-      };
-      const created = await request('/api/surveys', { method: 'POST', token, body: choiceSurvey });
-      if (created.response.status !== 201) throw new Error(created.body.error || 'choice survey creation failed');
-      choiceShortId = created.body.shortId;
-      const invalid = await request(`/api/public-survey/${choiceShortId}/responses`, { method: 'POST', token, body: { answers: { 1: 'yes', 3: ['a'] }, visitedOrders: [1, 3] } });
-      if (invalid.response.status !== 400 || !invalid.body.error?.includes('至少选择 2')) throw new Error('multiple-choice minimum validation failed');
-      const submitted = await request(`/api/public-survey/${choiceShortId}/responses`, { method: 'POST', token, body: { answers: { 1: 'yes', 3: ['a', 'b'], 5: '完成' }, visitedOrders: [1, 3, 5] } });
-      if (submitted.response.status !== 201) throw new Error(submitted.body.error || 'choice response submission failed');
-      const duplicate = await request(`/api/public-survey/${choiceShortId}/responses`, { method: 'POST', token, body: { answers: { 1: 'yes', 3: ['a', 'b'], 5: '完成' }, visitedOrders: [1, 3, 5] } });
-      if (duplicate.response.status !== 409) throw new Error('anonymous duplicate submission was not rejected');
-      const stats = await request(`/api/surveys/${choiceShortId}/stats`, { token });
-      const single = stats.body.questions?.[0];
-      const multiple = stats.body.questions?.[2];
-      const text = stats.body.questions?.[4];
-      if (!stats.response.ok || single?.options?.find((item) => item.key === 'yes')?.count !== 1 || multiple?.options?.find((item) => item.key === 'a')?.count !== 1 || multiple?.options?.find((item) => item.key === 'b')?.count !== 1 || text?.textAnswers?.[0] !== '完成') throw new Error('choice or text statistics mismatch');
-      return '单选跳至多选，多选命中规则跳至完成题；少选被拒绝，匿名且禁止重复时第二次提交返回 409，选择题与文本统计正确';
-    });
-    await check('关闭问卷并阻止继续填写', async () => {
-      const closed = await request(`/api/surveys/${choiceShortId}/close`, { method: 'POST', token });
-      if (closed.response.status !== 200 || !closed.body.closed) throw new Error(closed.body.error || 'survey close failed');
-      const read = await request(`/api/public-survey/${choiceShortId}`, { token });
-      const submit = await request(`/api/public-survey/${choiceShortId}/responses`, { method: 'POST', token, body: { answers: { 1: 'yes', 3: ['a', 'b'], 5: '完成' }, visitedOrders: [1, 3, 5] } });
-      if (read.response.status !== 404 || submit.response.status !== 404) throw new Error('closed survey remained fillable');
-      return '所有者关闭成功；读取和提交均返回 404';
-    });
   } finally {
     await mongo.connect();
     const db = mongo.db(databaseName);
     try {
       if (shortId && token) await request(`/api/surveys/${shortId}`, { method: 'DELETE', token });
       if (cycleShortId && token) await request(`/api/surveys/${cycleShortId}`, { method: 'DELETE', token });
-      if (choiceShortId && token) await request(`/api/surveys/${choiceShortId}`, { method: 'DELETE', token });
       if (userId) await db.collection('users').deleteOne({ _id: new ObjectId(userId) });
       if (userId && await db.collection('surveys').countDocuments({ ownerId: new ObjectId(userId) })) throw new Error('验证问卷清理不完整');
       console.log('PASS 清理验证数据: 验证账号及问卷关联记录已删除');

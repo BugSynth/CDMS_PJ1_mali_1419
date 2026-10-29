@@ -1,11 +1,16 @@
+if (typeof window === 'undefined' || typeof document === 'undefined') {
+  console.error('public/app.js 是浏览器端脚本，请通过 npm start 启动服务后在浏览器访问网页，不要使用 node 直接运行。');
+} else {
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const state = { token: localStorage.getItem('questionnaireToken'), username: localStorage.getItem('questionnaireUser'), mode: 'login', questions: [], rules: [], editingShortId: null, survey: null, answers: {}, currentOrder: 1, fillerRules: [], visitHistory: [] };
+let storedVerificationFixture = null;
+try { storedVerificationFixture = JSON.parse(localStorage.getItem('questionnaireVerificationFixture') || 'null'); } catch (_) { storedVerificationFixture = null; }
+const state = { token: localStorage.getItem('questionnaireToken'), username: localStorage.getItem('questionnaireUser'), mode: 'login', questions: [], rules: [], banks: [], templates: [], surveyTemplates: [], editingShortId: null, editingTemplateId: null, templateEditMode: 'update', survey: null, answers: {}, currentOrder: 1, fillerRules: [], visitHistory: [], verificationFixture: storedVerificationFixture, verificationPromptPrefix: storedVerificationFixture?.promptPrefix || '' };
 const surveyRoute = location.pathname.match(/^\/survey\/([^/]+)$/);
 
 function safe(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 async function api(url, options = {}) {
-  const response = await fetch(url, { ...options, headers: { 'content-type': 'application/json', ...(state.token ? { authorization: `Bearer ${state.token}` } : {}), ...options.headers } });
+  const response = await fetch(url, { cache: 'no-store', ...options, headers: { 'content-type': 'application/json', ...(state.token ? { authorization: `Bearer ${state.token}` } : {}), ...options.headers } });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) { const error = new Error(body.error || `请求失败 (${response.status})`); error.status = response.status; error.body = body; throw error; }
   return body;
@@ -28,32 +33,195 @@ $('#authForm').onsubmit = async (event) => {
 function logout(message = '') { localStorage.clear(); state.token = null; state.username = null; $('#identity').innerHTML = ''; $('#authForm').reset(); authMessage(message); setBusy(false); showView('authPane'); if (!message) toast('已退出登录'); }
 async function loadDashboard() {
   showView('dashboard'); $('#identity').innerHTML = `<span>${safe(state.username)}</span><button class="quiet" id="logout" type="button">退出</button>`; $('#logout').onclick = logout;
+  $('#libraryPanel').hidden = true; $('#surveyLibraryPanel').hidden = true; $('#builder').hidden = true; $('#casePanel').hidden = true; $('#templatePicker').hidden = true; $('#surveyList').hidden = false;
   try { renderSurveys(await api('/api/surveys')); } catch (error) { logout(error.message); }
 }
+
+async function loadTemplates() {
+  try {
+    const [templates, banks] = await Promise.all([api('/api/question-templates'), api('/api/question-banks')]);
+    state.templates = Array.isArray(templates) ? templates.filter((item) => item && item.id) : [];
+    state.banks = Array.isArray(banks) ? banks.filter((item) => item && item.id) : [];
+    $('#templateBank').innerHTML = '<option value="">未归类</option>' + state.banks.map((bank) => `<option value="${bank.id}">${safe(bank.name)}</option>`).join('');
+    const bankCounts = new Map();
+    for (const template of state.templates) if (template.bankId) bankCounts.set(template.bankId, (bankCounts.get(template.bankId) || new Set()).add(template.rootQuestionId || template.id));
+    $('#bankList').innerHTML = state.banks.length ? state.banks.map((bank) => `<div class="bank-row"><span>${safe(bank.name)} <small>（${bankCounts.get(bank.id)?.size || 0} 道题）</small></span><button class="danger" data-delete-bank="${bank.id}" type="button">删除题库</button></div>`).join('') : '<span class="muted">暂无题库，题目也可以先保存为未归类。</span>';
+    const filterValue = $('#templateBankFilter').value;
+    $('#templateBankFilter').innerHTML = '<option value="">全部题库</option><option value="__uncategorized">未归类</option>' + state.banks.map((bank) => `<option value="${bank.id}">${safe(bank.name)}</option>`).join('');
+    $('#templateBankFilter').value = filterValue;
+    const selectedTemplates = state.templates.filter((template) => !filterValue || (filterValue === '__uncategorized' ? !template.bankId : template.bankId === filterValue));
+    const groups = new Map();
+    for (const template of selectedTemplates) {
+      const key = template.rootQuestionId || template.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(template);
+    }
+    $('#templateList').innerHTML = selectedTemplates.length ? [...groups.values()].map((versions) => {
+      versions.sort((left, right) => right.version - left.version);
+      const currentId = versions.find((item) => item.currentVersionId)?.currentVersionId;
+      const latest = versions.find((item) => item.id === currentId) || versions[0];
+      const question = latest.question && typeof latest.question === 'object' ? latest.question : {};
+      const prompt = question.prompt || '（题目内容缺失）';
+      const version = Number.isInteger(latest.version) ? latest.version : 1;
+      return `<article class="template-row"><div><h3>${safe(prompt)}</h3><div class="survey-meta">当前 v${version}${latest.versionName ? ` · ${safe(latest.versionName)}` : ''} · ${safe(latest.bankName || '未归类')} · 共 ${versions.length}/10 个版本 · ${latest.visibility === 'shared' ? '已共享' : '私有'}</div></div><div class="template-actions"><button class="quiet" data-template-history="${latest.id}" type="button">版本历史</button><button class="quiet" data-edit-template="${latest.id}" type="button" ${latest.question ? '' : 'disabled'}>编辑题目</button><button class="quiet" data-clone-template="${latest.id}" type="button" ${latest.question ? '' : 'disabled'}>复制为新题目</button><button class="quiet" data-share-template="${latest.id}" type="button">共享</button><button class="quiet" data-template-usage="${latest.id}" type="button">查看使用</button><button class="quiet" data-template-stats="${latest.id}" type="button">跨问卷统计</button><button class="danger" data-delete-template="${latest.id}" type="button">删除题目</button></div></article>`;
+    }).join('') : '<div class="empty">还没有可复用题目。</div>';
+    $$('[data-template-history]').forEach((button) => button.onclick = async () => {
+      try {
+        const data = await api(`/api/question-templates/${encodeURIComponent(button.dataset.templateHistory)}/history`);
+        renderTemplateHistory(data.versions);
+      } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-template-usage]').forEach((button) => button.onclick = async () => {
+      try { const data = await api(`/api/question-templates/${encodeURIComponent(button.dataset.templateUsage)}/usage`); toast(`该题已被 ${data.usages.length} 份问卷使用`, 'info'); } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-share-template]').forEach((button) => button.onclick = async () => {
+      const username = window.prompt('请输入要共享给的用户名');
+      if (!username) return;
+      try { await api(`/api/question-templates/${encodeURIComponent(button.dataset.shareTemplate)}/share`, { method: 'POST', body: JSON.stringify({ username }) }); toast('题目已共享', 'success'); await loadTemplates(); } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-edit-template]').forEach((button) => button.onclick = () => beginTemplateEdit(state.templates.find((item) => item.id === button.dataset.editTemplate)));
+    $$('[data-clone-template]').forEach((button) => button.onclick = () => beginTemplateClone(state.templates.find((item) => item.id === button.dataset.cloneTemplate)));
+    $$('[data-template-stats]').forEach((button) => button.onclick = async () => {
+      try { const data = await api(`/api/question-stats/${encodeURIComponent(button.dataset.templateStats)}`); $('#templateMessage').textContent = `跨问卷回答 ${data.responseCount} 条${data.average === null ? '' : `，数字平均值 ${data.average}`}`; } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-delete-bank]').forEach((button) => button.onclick = async () => {
+      if (!window.confirm('确定删除这个空题库吗？题库中有题目时需要先移除题目归属。')) return;
+      try { await api(`/api/question-banks/${encodeURIComponent(button.dataset.deleteBank)}`, { method: 'DELETE' }); toast('题库已删除', 'success'); await loadTemplates(); } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-delete-template]').forEach((button) => button.onclick = async () => {
+      if (!window.confirm('确定删除整道题目及其全部版本吗？如果已有问卷使用，将无法删除。')) return;
+      try { await api(`/api/question-templates/${encodeURIComponent(button.dataset.deleteTemplate)}/chain`, { method: 'DELETE' }); toast('题目及其全部版本已删除', 'success'); await loadTemplates(); } catch (error) { toast(error.message, 'error'); }
+    });
+  } catch (error) { $('#templateList').innerHTML = `<div class="empty">${safe(error.message)}</div>`; }
+}
+
+function renderTemplateHistory(versions) {
+  if (!Array.isArray(versions)) {
+    toast('题目历史数据格式无效，请刷新后重试', 'error');
+    return;
+  }
+  $('#templateHistory').hidden = false;
+  $('#templateHistoryDetail').hidden = true;
+  $('#templateHistoryList').innerHTML = versions.map((template) => {
+    const question = template.question && typeof template.question === 'object' ? template.question : {};
+    const source = template.derivedFromVersion ? `基于 v${template.derivedFromVersion} 修改` : '初始版本';
+    const restored = template.restoredFromVersion ? ` · 恢复自 v${template.restoredFromVersion}` : '';
+    return `<article class="history-row"><button class="history-detail-button" data-history-detail="${template.id}" type="button"><strong>v${Number.isInteger(template.version) ? template.version : '?'}</strong>${template.current ? '（当前）' : ''} · ${safe(template.versionName || '未命名版本')} · ${safe(question.prompt || '（题目内容缺失）')}<span class="survey-meta">${source}${restored} · ${template.createdAt ? new Date(template.createdAt).toLocaleString() : '时间未知'}</span></button><div class="template-actions"><button class="quiet" data-restore-template="${template.id}" type="button" ${template.question && !template.current ? '' : 'disabled'}>回溯到此版本</button><button class="danger" data-delete-history-template="${template.id}" type="button" ${template.current ? 'disabled' : ''}>删除该版本</button></div></article>`;
+  }).join('');
+  $$('[data-history-detail]').forEach((button) => button.onclick = () => {
+    const selected = versions.find((item) => item.id === button.dataset.historyDetail);
+    if (!selected) return;
+    const question = selected.question || {};
+    $('#templateHistoryDetail').hidden = false;
+    $('#templateHistoryDetail').innerHTML = `<h3>v${selected.version} 详情</h3><dl><dt>题干</dt><dd>${safe(question.prompt || '（缺失）')}</dd><dt>题型</dt><dd>${safe(question.type || '未知')}</dd><dt>必答</dt><dd>${question.required ? '是' : '否'}</dd><dt>选项</dt><dd>${question.options?.length ? question.options.map((option) => safe(option.text)).join('、') : '无'}</dd><dt>校验</dt><dd><code>${safe(JSON.stringify(question.validation || {}))}</code></dd></dl>`;
+  });
+  $$('[data-restore-template]').forEach((button) => button.onclick = async () => {
+    if (!window.confirm('将当前题目回溯到这个版本吗？不会新增版本，旧版本仍保留。')) return;
+    try {
+      const restored = await api(`/api/question-templates/${encodeURIComponent(button.dataset.restoreTemplate)}/restore`, { method: 'POST' });
+      toast(`已回溯到 v${restored.rolledBackToVersion}`, 'success');
+      await loadTemplates();
+      const history = await api(`/api/question-templates/${encodeURIComponent(restored.id)}/history`);
+      renderTemplateHistory(history.versions);
+    } catch (error) { toast(error.message, 'error'); }
+  });
+  $$('[data-delete-history-template]').forEach((button) => button.onclick = async () => {
+    if (!window.confirm('删除该版本后将无法从历史中回溯到它，确定删除吗？')) return;
+    try { await api(`/api/question-templates/${encodeURIComponent(button.dataset.deleteHistoryTemplate)}`, { method: 'DELETE' }); toast('版本已删除', 'success'); const anchor = versions.find((item) => item.id !== button.dataset.deleteHistoryTemplate); if (anchor) { const history = await api(`/api/question-templates/${encodeURIComponent(anchor.id)}/history`); renderTemplateHistory(history.versions); } await loadTemplates(); } catch (error) { toast(error.message, 'error'); }
+  });
+}
+
+$('#libraryToggle').onclick = async () => { $('#builder').hidden = true; $('#casePanel').hidden = true; $('#surveyList').hidden = true; $('#libraryPanel').hidden = false; $('#libraryPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }); await loadTemplates(); };
+$('#libraryClose').onclick = loadDashboard;
+$('#refreshTemplates').onclick = loadTemplates;
+$('#templateBankFilter').onchange = loadTemplates;
+$('#templateHistoryClose').onclick = () => { $('#templateHistory').hidden = true; };
+async function loadSurveyTemplates() {
+  try {
+    state.surveyTemplates = await api('/api/survey-templates');
+    $('#surveyTemplateList').innerHTML = state.surveyTemplates.length ? state.surveyTemplates.map((template) => `<article class="template-row"><div><h3>${safe(template.title)}</h3><div class="survey-meta">${template.questions.length} 道题 · 更新于 ${new Date(template.updatedAt).toLocaleString()}</div></div><div class="template-actions"><button class="primary" data-use-survey-template="${template.id}" type="button">基于此模板新建</button><button class="danger" data-delete-survey-template="${template.id}" type="button">删除模板</button></div></article>`).join('') : '<div class="empty">问卷库还没有模板。可在“我的问卷”中将草稿保存到问卷库。</div>';
+    $$('[data-delete-survey-template]').forEach((button) => button.onclick = async () => {
+      if (!window.confirm('确定删除这份问卷模板吗？已创建的问卷不会受影响。')) return;
+      try { await api(`/api/survey-templates/${encodeURIComponent(button.dataset.deleteSurveyTemplate)}`, { method: 'DELETE' }); toast('问卷模板已删除', 'success'); await loadSurveyTemplates(); } catch (error) { toast(error.message, 'error'); }
+    });
+    $$('[data-use-survey-template]').forEach((button) => button.onclick = () => useSurveyTemplate(button.dataset.useSurveyTemplate));
+  } catch (error) { $('#surveyTemplateList').innerHTML = `<div class="empty">${safe(error.message)}</div>`; }
+}
+$('#surveyLibraryToggle').onclick = async () => { $('#libraryPanel').hidden = true; $('#builder').hidden = true; $('#casePanel').hidden = true; $('#surveyList').hidden = true; $('#surveyLibraryPanel').hidden = false; await loadSurveyTemplates(); $('#surveyLibraryPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+$('#surveyLibraryClose').onclick = loadDashboard;
+function useSurveyTemplate(id) {
+  const template = state.surveyTemplates.find((item) => item.id === id);
+  if (!template) return;
+  if (state.questions.length && !window.confirm('使用问卷模板会替换当前尚未保存的编辑内容，是否继续？')) return;
+  state.editingShortId = null;
+  state.questions = template.questions.map((question) => ({ ...question, options: question.options?.map((option) => ({ ...option })) || [], validation: { ...(question.validation || {}) }, fillKind: question.type === 'number' ? 'number' : question.type === 'text' ? 'text' : undefined }));
+  state.rules = template.jumpRules.map((rule) => ({ sourceOrder: rule.sourceOrder, targetOrder: rule.targetOrder, operator: rule.condition.operator, optionKeys: rule.condition.optionKeys || [], value: rule.condition.value, min: rule.condition.min, max: rule.condition.max, priority: rule.priority }));
+  const form = $('#surveyForm'); form.reset(); form.elements.title.value = `${template.title}（副本）`; form.elements.description.value = template.description || ''; form.elements.allowAnonymous.checked = Boolean(template.allowAnonymous); form.elements.allowMultipleResponses.checked = Boolean(template.allowMultipleResponses);
+  $('#templatePicker').hidden = true; $('#builder .section-head h2').textContent = '问卷设置'; renderQuestions(); renderRules(); openBuilder(); toast('已从问卷库创建新问卷草稿', 'success');
+}
+function renderTemplatePicker() {
+  const filter = $('#templatePickerBankFilter').value;
+  const templates = state.templates.filter((template) => template.question && (!filter || (filter === '__uncategorized' ? !template.bankId : template.bankId === filter)));
+  $('#templatePickerList').innerHTML = templates.length ? templates.map((template) => `<article class="template-row"><div><h3>${safe(template.question.prompt || '（题目内容缺失）')}</h3><div class="survey-meta">v${template.version}${template.versionName ? ` · ${safe(template.versionName)}` : ''} · ${safe(template.bankName || '未归类')} · ${safe(template.question.type || '未知题型')}</div></div><button class="quiet" data-pick-template="${template.id}" type="button">加入此题</button></article>`).join('') : '<div class="empty">该题库中还没有可用题目。</div>';
+  $$('[data-pick-template]').forEach((button) => button.onclick = () => { const template = state.templates.find((item) => item.id === button.dataset.pickTemplate); if (!template?.question) return; state.questions.push({ ...template.question, sourceTemplateId: template.id, sourceTemplateVersion: template.version }); $('#templatePicker').hidden = true; renderQuestions(); renderRules(); toast(`已加入“${template.question.prompt}”`, 'success'); });
+}
+$('#pickTemplate').onclick = async () => { $('#templatePicker').hidden = false; await loadTemplates(); const filter = $('#templatePickerBankFilter').value; $('#templatePickerBankFilter').innerHTML = '<option value="">全部题库</option><option value="__uncategorized">未归类</option>' + state.banks.map((bank) => `<option value="${bank.id}">${safe(bank.name)}</option>`).join(''); $('#templatePickerBankFilter').value = filter; renderTemplatePicker(); };
+$('#templatePickerBankFilter').onchange = renderTemplatePicker;
+$('#closeTemplatePicker').onclick = () => { $('#templatePicker').hidden = true; };
+function beginTemplateEdit(template) {
+  if (!template) return;
+  state.editingTemplateId = template.id;
+  state.templateEditMode = 'update';
+  const form = $('#templateForm'); form.elements.prompt.value = template.question.prompt; form.elements.versionName.value = ''; form.elements.versionName.placeholder = `例如：${template.version + 1}月修订版`; form.elements.type.value = template.question.type; form.elements.bankId.value = template.bankId || ''; form.elements.required.checked = Boolean(template.question.required); form.elements.options.value = (template.question.options || []).map((option) => option.text).join('\n'); form.elements.minLength.value = template.question.type === 'text' ? (template.question.validation?.minLength ?? '') : template.question.validation?.min ?? ''; form.elements.maxLength.value = template.question.type === 'text' ? (template.question.validation?.maxLength ?? '') : template.question.validation?.max ?? ''; form.elements.minSelections.value = template.question.validation?.minSelections ?? ''; form.elements.maxSelections.value = template.question.validation?.maxSelections ?? ''; form.elements.integerOnly.value = template.question.validation?.integerOnly ? 'true' : 'false'; syncTemplateFields(); $('#templateSubmit').textContent = '保存版本'; $('#templateCancelEdit').hidden = false; $('#templateForm').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+function beginTemplateClone(template) {
+  if (!template) return;
+  state.editingTemplateId = template.id;
+  state.templateEditMode = 'clone';
+  beginTemplateEdit(template);
+  state.templateEditMode = 'clone';
+  $('#templateSubmit').textContent = '保存为新题目';
+}
+$('#templateCancelEdit').onclick = () => { state.editingTemplateId = null; state.templateEditMode = 'update'; $('#templateForm').reset(); $('#templateForm').elements.versionName.placeholder = '例如：适用于 2026 年调查'; syncTemplateFields(); $('#templateSubmit').textContent = '保存为新题目'; $('#templateCancelEdit').hidden = true; };
+function syncTemplateFields() {
+  const type = $('#templateForm').elements.type.value;
+  const choice = type === 'single_choice' || type === 'multiple_choice';
+  const number = type === 'number';
+  $('#templateOptionsField').hidden = !choice;
+  $('#templateChoiceValidation').hidden = !choice || type === 'single_choice';
+  $('#templateFillValidation').hidden = choice;
+  $('#templateIntegerField').hidden = !number;
+  $('#templateForm').elements.options.required = choice;
+}
+$('#templateForm').elements.type.onchange = syncTemplateFields;
+syncTemplateFields();
+$('#templateForm').onsubmit = async (event) => {
+  event.preventDefault(); const formElement = event.currentTarget; const form = new FormData(formElement); const type = form.get('type');
+  const options = String(form.get('options') || '').split('\n').map((text, index) => ({ key: `option_${index + 1}`, text: text.trim(), order: index + 1 })).filter((option) => option.text);
+  const validation = type === 'text' ? { ...(form.get('minLength') !== '' ? { minLength: Number(form.get('minLength')) } : {}), ...(form.get('maxLength') !== '' ? { maxLength: Number(form.get('maxLength')) } : {}) } : type === 'number' ? { ...(form.get('minLength') !== '' ? { min: Number(form.get('minLength')) } : {}), ...(form.get('maxLength') !== '' ? { max: Number(form.get('maxLength')) } : {}), integerOnly: form.get('integerOnly') === 'true' } : type === 'multiple_choice' ? { minSelections: Number(form.get('minSelections') || 0), maxSelections: Number(form.get('maxSelections') || options.length) } : {};
+  try { const editMode = state.templateEditMode; const path = state.editingTemplateId ? `/api/question-templates/${encodeURIComponent(state.editingTemplateId)}/${editMode === 'clone' ? 'clone' : 'versions'}` : '/api/question-templates'; const saved = await api(path, { method: 'POST', body: JSON.stringify({ versionName: form.get('versionName'), ...(form.get('bankId') ? { bankId: form.get('bankId') } : {}), question: { type, prompt: form.get('prompt'), required: form.has('required'), options, validation } }) }); formElement.reset(); state.editingTemplateId = null; state.templateEditMode = 'update'; syncTemplateFields(); $('#templateSubmit').textContent = '保存为新题目'; $('#templateCancelEdit').hidden = true; toast(editMode === 'clone' ? '已复制为新题目' : '同一题目的新版本已保存', 'success'); await loadTemplates(); if (editMode === 'update') { const history = await api(`/api/question-templates/${encodeURIComponent(saved.id)}/history`); renderTemplateHistory(history.versions); } } catch (error) { $('#templateMessage').textContent = error.message; toast(error.message, 'error'); }
+};
+$('#bankForm').onsubmit = async (event) => {
+  event.preventDefault(); const formElement = event.currentTarget; const form = new FormData(formElement);
+  try { await api('/api/question-banks', { method: 'POST', body: JSON.stringify({ name: form.get('name') }) }); formElement.reset(); toast('题库已创建', 'success'); await loadTemplates(); } catch (error) { toast(error.message, 'error'); }
+};
 function renderSurveys(surveys) {
   $('#surveyList').innerHTML = surveys.length ? surveys.map((survey) => {
     const shareUrl = `${location.origin}/survey/${encodeURIComponent(survey.shortId)}`;
     const publishedActions = `<div class="share-area"><code class="share-url">${safe(shareUrl)}</code><div class="share-actions"><button class="quiet" data-copy-link="${safe(shareUrl)}" type="button">复制链接</button><a class="share" href="/survey/${encodeURIComponent(survey.shortId)}" target="_blank" rel="noopener">打开链接</a></div></div>`;
-    const statusLabel = survey.status === 'published' ? '已发布' : survey.status === 'closed' ? '已关闭' : '草稿';
-    return `<article class="survey-row"><div><h3>${safe(survey.title)}</h3><div class="survey-meta"><span class="status ${survey.status}">${statusLabel}</span> ${new Date(survey.updatedAt).toLocaleString()}</div>${survey.status === 'published' ? publishedActions : ''}</div><div class="survey-actions">${survey.status === 'draft' ? `<button class="quiet" data-edit="${survey.shortId}" type="button">继续编辑</button><button class="primary" data-publish="${survey.shortId}" type="button">发布</button>` : ''}${survey.status === 'published' ? `<button class="quiet" data-close="${survey.shortId}" type="button">关闭</button>` : ''}<button class="quiet" data-stats="${survey.shortId}" type="button">统计</button></div></article>`;
+    return `<article class="survey-row"><div><h3>${safe(survey.title)}</h3><div class="survey-meta"><span class="status ${survey.status}">${survey.status === 'published' ? '已发布' : '草稿'}</span> ${new Date(survey.updatedAt).toLocaleString()}</div>${survey.status === 'published' ? publishedActions : ''}</div><div class="survey-actions">${survey.status === 'draft' ? `<button class="quiet" data-edit="${survey.shortId}" type="button">继续编辑</button><button class="quiet" data-save-survey-template="${survey.shortId}" data-survey-title="${safe(survey.title)}" type="button">存入问卷库</button><button class="primary" data-publish="${survey.shortId}" type="button">发布</button>` : ''}<button class="quiet" data-stats="${survey.shortId}" type="button">统计</button></div></article>`;
   }).join('') : '<div class="empty">还没有问卷，创建第一份问卷开始使用。</div>';
   $$('[data-stats]').forEach((button) => button.onclick = () => showStats(button.dataset.stats));
   $$('[data-edit]').forEach((button) => button.onclick = () => editDraft(button.dataset.edit));
   $$('[data-publish]').forEach((button) => button.onclick = () => editDraft(button.dataset.publish, true));
-  $$('[data-close]').forEach((button) => button.onclick = () => closeSurvey(button.dataset.close));
+  $$('[data-save-survey-template]').forEach((button) => button.onclick = async () => {
+    const title = window.prompt('问卷库模板名称', button.dataset.surveyTitle);
+    if (!title?.trim()) return;
+    try { await api('/api/survey-templates', { method: 'POST', body: JSON.stringify({ sourceShortId: button.dataset.saveSurveyTemplate, title: title.trim() }) }); toast('已保存到问卷库', 'success'); } catch (error) { toast(error.message, 'error'); }
+  });
   $$('[data-copy-link]').forEach((button) => button.onclick = async () => {
     try { await navigator.clipboard.writeText(button.dataset.copyLink); toast('链接已复制', 'success'); }
     catch { toast('复制失败，请手动复制链接', 'error'); }
   });
-}
-
-async function closeSurvey(shortId) {
-  if (!window.confirm('关闭后将不能继续填写，确定关闭此问卷吗？')) return;
-  try {
-    await api(`/api/surveys/${encodeURIComponent(shortId)}/close`, { method: 'POST' });
-    toast('问卷已关闭', 'success');
-    await loadDashboard();
-  } catch (error) { toast(error.message, 'error'); }
 }
 
 function renderCaseResults(results) {
@@ -86,7 +254,8 @@ async function checkBrowserJumpLegacy(shortId, optionKey, expectedPrompt) {
     frame.onload = () => { clearTimeout(timeout); resolve(); };
     frame.onerror = () => { clearTimeout(timeout); reject(new Error('填写页面加载失败')); };
   });
-  frame.src = `/survey/${encodeURIComponent(shortId)}?verification=${Date.now()}`;
+  const verificationQuery = `verification=${Date.now()}&verificationToken=${encodeURIComponent(state.token || '')}`;
+  frame.src = `/survey/${encodeURIComponent(shortId)}?${verificationQuery}`;
   await loaded;
   const startedAt = Date.now();
   let doc;
@@ -131,12 +300,34 @@ async function checkBrowserJump(shortId, branch, unusedExpectedPrompt) {
     frame.onload = () => { clearTimeout(timeout); resolve(); };
     frame.onerror = () => { clearTimeout(timeout); reject(new Error('Filling page failed to load')); };
   });
-  frame.src = `/survey/${encodeURIComponent(shortId)}?verification=${Date.now()}`;
+  const verificationQuery = `verification=${Date.now()}&verificationToken=${encodeURIComponent(state.token || '')}`;
+  frame.src = `/survey/${encodeURIComponent(shortId)}?${verificationQuery}`;
   await loaded;
-  const input = frame.contentDocument?.querySelector('[name="answer"]');
-  if (!input || !frame.contentDocument.querySelector('.answer-card h2')) throw new Error('Question 1 input was not rendered');
+  // 浏览器隐私策略可能让新 iframe 暂时读不到父页面令牌，主动同步后重载填写页。
+  if (!frame.contentDocument?.querySelector('[name="answer"]') && frame.contentDocument?.querySelector('#authPane:not([hidden])')) {
+    frame.contentWindow.localStorage.setItem('questionnaireToken', state.token || '');
+    frame.contentWindow.localStorage.setItem('questionnaireUser', state.username || '');
+    frame.src = `/survey/${encodeURIComponent(shortId)}?${verificationQuery}`;
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('填写页面重新加载超时')), 8000);
+      frame.onload = () => { clearTimeout(timeout); resolve(); };
+      frame.onerror = () => { clearTimeout(timeout); reject(new Error('填写页面重新加载失败')); };
+    });
+  }
+  const waitForAnswer = async () => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 10000) {
+      const doc = frame.contentDocument;
+      const input = doc?.querySelector('[name="answer"]');
+      if (input && doc.querySelector('.answer-card h2')) return input;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const text = frame.contentDocument?.body?.innerText?.trim().slice(0, 240) || '页面无内容';
+    throw new Error(`填写页第1题未渲染（页面状态：${text}）`);
+  };
+  const input = await waitForAnswer();
   const value = branch === 'yes' ? 20 : 17;
-  const expectedPrompt = branch === 'yes' ? 'Reached path' : 'Skipped path';
+  const expectedPrompt = `${state.verificationPromptPrefix}${branch === 'yes' ? '到达路径' : '跳过路径'}`;
   input.value = String(value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
   frame.contentDocument.querySelector('#next').click();
@@ -155,22 +346,65 @@ async function checkBrowserJump(shortId, branch, unusedExpectedPrompt) {
 }
 
 $('#casesToggle').onclick = () => { $('#casePanel').hidden = !$('#casePanel').hidden; };
+function clearVerificationFixture() {
+  state.verificationFixture = null;
+  state.verificationPromptPrefix = '';
+  localStorage.removeItem('questionnaireVerificationFixture');
+  $('#deleteCases').hidden = true;
+}
+
+async function clearStaleVerificationFixture() {
+  const fixture = state.verificationFixture;
+  if (!fixture?.surveyShortId) return false;
+  try {
+    await api(`/api/surveys/${encodeURIComponent(fixture.surveyShortId)}/edit`);
+    return false;
+  } catch (error) {
+    if (error.status !== 404) return false;
+    clearVerificationFixture();
+    toast('已清除不存在的旧测试数据标记', 'info');
+    return true;
+  }
+}
+
+async function deleteVerificationFixture() {
+  const fixture = state.verificationFixture;
+  if (!fixture) return toast('当前没有可删除的测试数据', 'info');
+  if (!window.confirm('确定删除本次功能验证创建的测试用问卷、题目和题库吗？')) return;
+  const errors = [];
+  const remove = async (path) => {
+    try { await api(path, { method: 'DELETE' }); }
+    catch (error) { if (error.status !== 404) errors.push(error.message); }
+  };
+  if (fixture.surveyShortId) await remove(`/api/surveys/${encodeURIComponent(fixture.surveyShortId)}`);
+  if (fixture.templateId) await remove(`/api/question-templates/${encodeURIComponent(fixture.templateId)}/chain`);
+  if (fixture.bankId) await remove(`/api/question-banks/${encodeURIComponent(fixture.bankId)}`);
+  if (errors.length) return toast(`测试数据删除部分失败：${errors.join('；')}`, 'error');
+  clearVerificationFixture(); toast('测试数据已删除', 'success'); await loadDashboard();
+}
+$('#deleteCases').onclick = deleteVerificationFixture;
+$('#deleteCases').hidden = !state.verificationFixture;
 $('#runCases').onclick = async () => {
   const button = $('#runCases');
   const results = [];
   let shortId;
+  let verificationBankId;
+  let verificationTemplateId;
   const record = async (name, action) => {
     try { const evidence = await action(); results.push({ name, ok: true, evidence }); }
-    catch (error) { results.push({ name, ok: false, evidence: error.evidence || { error: error.message, status: error.status, response: error.body } }); throw error; }
+    catch (error) { results.push({ name, ok: false, evidence: error.evidence || { error: error.message, status: error.status, response: error.body } }); }
     finally { renderCaseResults(results); }
   };
+  await clearStaleVerificationFixture();
+  if (state.verificationFixture) return toast('请先点击“一键删除测试数据”，再运行新一轮验证', 'error');
   button.disabled = true;
   button.textContent = '验证中...';
   $('#caseResults').innerHTML = '<p class="muted">正在执行核心流程验证...</p>';
   try {
-    const marker = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(-12);
+    const marker = '测试用功能验证';
+    state.verificationPromptPrefix = marker;
     const draft = {
-      title: `功能验证问卷 ${marker}`, description: '此问卷由工作台功能验证创建，并会自动清理。', allowAnonymous: false, allowMultipleResponses: true, status: 'draft',
+      title: `${marker}问卷`, description: '此问卷由功能验证创建，删除测试数据后清理。', allowAnonymous: false, allowMultipleResponses: true, status: 'draft',
       questions: [
         { type: 'single_choice', prompt: '是否继续？', required: true, options: [{ key: 'yes', text: '继续', order: 1 }, { key: 'no', text: '结束', order: 2 }], validation: {} },
         { type: 'text', prompt: '意见', required: true, validation: { minLength: 2, maxLength: 30 } },
@@ -179,15 +413,16 @@ $('#runCases').onclick = async () => {
       jumpRules: [{ sourceOrder: 1, targetOrder: 3, priority: 1, condition: { answerType: 'single_choice', operator: 'equals', optionKeys: ['yes'] } }]
     };
     draft.questions = [
-      { type: 'number', prompt: 'Age threshold', required: true, validation: { min: 0, max: 120, integerOnly: true } },
-      { type: 'text', prompt: 'Skipped path', required: true, validation: { minLength: 2, maxLength: 30 } },
-      { type: 'text', prompt: 'Reached path', required: true, validation: { minLength: 2, maxLength: 30 } },
-      { type: 'number', prompt: '评分', required: true, validation: { min: 1, max: 5, integerOnly: true } }
+      { type: 'number', prompt: `${marker}年龄阈值`, required: true, validation: { min: 0, max: 120, integerOnly: true } },
+      { type: 'text', prompt: `${marker}跳过路径`, required: true, validation: { minLength: 2, maxLength: 30 } },
+      { type: 'text', prompt: `${marker}到达路径`, required: true, validation: { minLength: 2, maxLength: 30 } },
+      { type: 'number', prompt: `${marker}评分`, required: true, validation: { min: 1, max: 5, integerOnly: true } }
     ];
     draft.jumpRules = [{ sourceOrder: 1, targetOrder: 3, priority: 1, condition: { answerType: 'number', operator: 'gte', value: 18 } }];
     await record('保存草稿', async () => {
       const evidence = assertStatus(await verificationRequest('POST', '/api/surveys', draft), 201);
       shortId = evidence.response.body.shortId;
+      state.verificationFixture = { surveyShortId: shortId, promptPrefix: marker }; localStorage.setItem('questionnaireVerificationFixture', JSON.stringify(state.verificationFixture));
       evidence.assertion.expected = '返回问卷 shortId';
       evidence.assertion.actual = shortId;
       evidence.assertion.passed = Boolean(shortId);
@@ -216,7 +451,7 @@ $('#runCases').onclick = async () => {
     }));
     await record('拒绝非法数字答案', async () => {
       const evidence = await verificationRequest('POST', `/api/public-survey/${encodeURIComponent(shortId)}/responses`, { answers: { 1: 20, 3: 'adult', 4: 9 }, visitedOrders: [1, 3, 4] });
-      evidence.assertion = { expectedStatus: 400, actualStatus: evidence.response.status, expectedErrorContains: '评分', actualError: evidence.response.body.error, passed: evidence.response.status === 400 && evidence.response.body.error?.includes('评分') };
+      evidence.assertion = { expectedStatus: 400, actualStatus: evidence.response.status, expectedErrorContains: `${marker}评分`, actualError: evidence.response.body.error, passed: evidence.response.status === 400 && evidence.response.body.error?.includes(`${marker}评分`) };
       if (!evidence.assertion.passed) throw Object.assign(new Error('越界数字没有返回预期的服务端校验错误'), { evidence });
       return evidence;
     });
@@ -236,24 +471,36 @@ $('#runCases').onclick = async () => {
       evidence.response.body = { submittedCount: data.submittedCount, visitDataComplete: data.visitDataComplete, questions: data.questions.map((item) => ({ order: item.question.order, prompt: item.question.prompt, responseCount: item.responseCount, visitedCount: item.visitedCount, skippedCount: item.skippedCount, unansweredCount: item.unansweredCount, average: item.average, options: item.options })) };
       return evidence;
     });
+    await record('题库与版本专项验证', async () => {
+      const bankEvidence = assertStatus(await verificationRequest('POST', '/api/question-banks', { name: `${marker}题库` }), 201);
+      verificationBankId = bankEvidence.response.body.id;
+      state.verificationFixture.bankId = verificationBankId;
+      localStorage.setItem('questionnaireVerificationFixture', JSON.stringify(state.verificationFixture));
+      const duplicate = await verificationRequest('POST', '/api/question-banks', { name: bankEvidence.response.body.name });
+      duplicate.assertion = { expectedStatus: 409, actualStatus: duplicate.response.status, passed: duplicate.response.status === 409 };
+      if (!duplicate.assertion.passed) throw Object.assign(new Error('重复题库名称未被拒绝'), { evidence: duplicate });
+      const templateEvidence = assertStatus(await verificationRequest('POST', '/api/question-templates', { bankId: verificationBankId, question: { type: 'text', prompt: `${marker}版本验证`, required: false, validation: {} } }), 201);
+      verificationTemplateId = templateEvidence.response.body.id;
+      state.verificationFixture.templateId = verificationTemplateId;
+      localStorage.setItem('questionnaireVerificationFixture', JSON.stringify(state.verificationFixture));
+      const listEvidence = await verificationRequest('GET', '/api/question-templates');
+      const listedTemplate = listEvidence.response.body.find((item) => item.id === verificationTemplateId);
+      listEvidence.assertion = { expectedBankName: bankEvidence.response.body.name, actualBankName: listedTemplate?.bankName, passed: listEvidence.response.status === 200 && listedTemplate?.bankName === bankEvidence.response.body.name };
+      if (!listEvidence.assertion.passed) throw Object.assign(new Error('题目列表没有显示所属题库'), { evidence: listEvidence });
+      const versionEvidence = assertStatus(await verificationRequest('POST', `/api/question-templates/${verificationTemplateId}/versions`, { versionName: `${marker}修订版`, question: { type: 'text', prompt: `${marker}版本验证更新`, required: false, validation: {} } }), 201);
+      const historyEvidence = await verificationRequest('GET', `/api/question-templates/${versionEvidence.response.body.id}/history`);
+      historyEvidence.assertion = { expected: { versionCount: 2, currentVersion: 2, bankName: bankEvidence.response.body.name }, actual: { versionCount: historyEvidence.response.body.versions?.length, currentVersion: historyEvidence.response.body.versions?.find((item) => item.current)?.version, bankName: templateEvidence.response.body.bankName }, passed: historyEvidence.response.status === 200 && historyEvidence.response.body.versions?.length === 2 && historyEvidence.response.body.versions?.some((item) => item.current && item.version === 2) };
+      if (!historyEvidence.assertion.passed) throw Object.assign(new Error('题库版本历史或当前指针异常'), { evidence: historyEvidence });
+      return { bank: bankEvidence, duplicate, template: templateEvidence, list: listEvidence, version: versionEvidence, history: historyEvidence };
+    });
   } catch (_) {
     // Individual failed steps are already shown in the panel.
   } finally {
-    if (shortId) {
-      try {
-        const evidence = assertStatus(await verificationRequest('DELETE', `/api/surveys/${encodeURIComponent(shortId)}`), 200);
-        const expectedRemoval = { answers: 3, responses: 1, jumpRules: 1, questions: 4 };
-        const removed = evidence.response.body.removed || {};
-        evidence.assertion = { expected: { deleted: true, removed: expectedRemoval }, actual: { deleted: evidence.response.body.deleted, removed }, passed: evidence.response.body.deleted === true && Object.entries(expectedRemoval).every(([key, count]) => removed[key] === count) };
-        if (!evidence.assertion.passed) throw Object.assign(new Error('级联删除数量与验证数据不符'), { evidence });
-        results.push({ name: '清理验证数据', ok: true, evidence });
-      } catch (error) { results.push({ name: '清理验证数据', ok: false, evidence: error.evidence || { error: error.message, status: error.status, response: error.body } }); }
-      renderCaseResults(results);
-    }
+    if (state.verificationFixture) { $('#deleteCases').hidden = false; }
     $('#caseBrowser').replaceChildren();
     button.disabled = false;
     button.textContent = '运行验证';
-    await loadDashboard();
+    try { renderSurveys(await api('/api/surveys')); } catch (error) { toast(`验证后刷新问卷失败：${error.message}`, 'error'); }
   }
 };
 
@@ -265,9 +512,9 @@ function isChoice(question) { return question.type === 'single_choice' || questi
 function questionKind(question) { return isChoice(question) ? question.type : 'fill'; }
 function normalizeRuleState() { state.rules = state.rules.filter((rule) => rule.sourceOrder <= state.questions.length && rule.targetOrder <= state.questions.length); }
 
-function openBuilder() { $('#builder').hidden = false; $('#builder').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+function openBuilder() { $('#libraryPanel').hidden = true; $('#surveyLibraryPanel').hidden = true; $('#casePanel').hidden = true; $('#surveyList').hidden = true; $('#builder').hidden = false; $('#builder').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
 $('#createToggle').onclick = () => { state.editingShortId = null; state.questions = []; state.rules = []; $('#surveyForm').reset(); $('#builder .section-head h2').textContent = '问卷设置'; renderQuestions(); renderRules(); openBuilder(); };
-$('#builderClose').onclick = () => { $('#builder').hidden = true; state.editingShortId = null; };
+$('#builderClose').onclick = () => { $('#builder').hidden = true; state.editingShortId = null; loadDashboard(); };
 $$('[data-add]').forEach((button) => button.onclick = () => { state.questions.push(newQuestion(button.dataset.add)); renderQuestions(); renderRules(); });
 
 function renderQuestions() {
@@ -369,7 +616,7 @@ async function editDraft(shortId, publishNow = false) {
 
 async function showStats(shortId) { try { const data = await api(`/api/surveys/${shortId}/stats`); const visitSummary = data.visitDataComplete ? '访问数据完整' : '历史答卷缺少访问路径，访问/跳过指标不显示'; showView('results'); $('#results').innerHTML = `<div class="result-head"><h1>问卷统计</h1><button class="quiet" id="backResults" type="button">返回</button></div><p>已提交 ${data.submittedCount} 份 · ${visitSummary}</p>${data.questions.map((item) => { const pathMetrics = item.visitDataComplete ? `<p class="muted">已回答 ${item.responseCount} · 已访问 ${item.visitedCount} · 被跳过 ${item.skippedCount} · 访问后未答 ${item.unansweredCount}</p>` : `<p class="muted">已回答 ${item.responseCount}</p>`; const values = item.options ? item.options.map((option) => `<p>${safe(option.text)}：${option.count}</p>`).join('') : item.textAnswers ? item.textAnswers.map((value) => `<p>${safe(value)}</p>`).join('') : `<p>平均值：${item.average ?? '暂无数据'}</p>`; return `<article class="result-question"><h3>${item.question.order}. ${safe(item.question.prompt)}</h3>${pathMetrics}${values}</article>`; }).join('')}`; $('#backResults').onclick = loadDashboard; } catch (error) { toast(error.message, 'error'); } }
 function answerInput(question) { if (isChoice(question)) return `<div class="answer-options">${question.options.map((option) => `<label class="answer-option"><input type="${question.type === 'single_choice' ? 'radio' : 'checkbox'}" name="answer" value="${safe(option.key)}"><span>${safe(option.text)}</span></label>`).join('')}</div>`; return `<div class="answer-field"><input name="answer" type="${question.type === 'number' ? 'number' : 'text'}" ${question.validation?.integerOnly ? 'step="1"' : ''} ${question.required ? 'aria-required="true"' : ''}></div>`; }
-async function openSurvey(shortId) { if (!state.token) { showView('authPane'); authMessage('请先登录后填写问卷。'); return; } try { const data = await api(`/api/public-survey/${shortId}`); state.survey = data.survey; state.questions = data.questions; state.fillerRules = data.jumpRules; state.answers = {}; state.currentOrder = data.questions[0]?.order || 1; state.visitHistory = state.currentOrder ? [state.currentOrder] : []; renderFill(); } catch (error) { showView('filler'); $('#filler').innerHTML = `<div class="empty">${safe(error.message)}</div>`; } }
+async function openSurvey(shortId) { const verificationToken = new URLSearchParams(location.search).get('verificationToken'); if (!state.token && verificationToken) state.token = verificationToken; if (!state.token) { showView('authPane'); authMessage('请先登录后填写问卷。'); return; } try { const data = await api(`/api/public-survey/${shortId}`); state.survey = data.survey; state.questions = data.questions; state.fillerRules = data.jumpRules; state.answers = {}; state.currentOrder = data.questions[0]?.order || 1; state.visitHistory = state.currentOrder ? [state.currentOrder] : []; renderFill(); } catch (error) { showView('filler'); $('#filler').innerHTML = `<div class="empty">${safe(error.message)}</div>`; } }
 function conditionMatches(condition, value) { if (condition.operator === 'equals') return value === condition.optionKeys?.[0]; if (condition.operator === 'includes_any') return Array.isArray(value) && (condition.optionKeys?.length ? condition.optionKeys.some((key) => value.includes(key)) : value.length > 0); if (condition.operator === 'includes_all') return Array.isArray(value) && condition.optionKeys.length > 0 && condition.optionKeys.every((key) => value.includes(key)); if (condition.operator === 'count_equals') return Array.isArray(value) && value.length === condition.value; if (condition.operator === 'count_gte') return Array.isArray(value) && value.length >= condition.value; if (condition.operator === 'count_lte') return Array.isArray(value) && value.length <= condition.value; if (condition.operator === 'between') return value >= condition.min && value <= condition.max; return condition.operator === 'gt' ? value > condition.value : condition.operator === 'gte' ? value >= condition.value : condition.operator === 'lt' ? value < condition.value : value <= condition.value; }
 function renderFill() {
   const question = state.questions.find((item) => item.order === state.currentOrder);
@@ -406,3 +653,4 @@ function renderFill() {
 async function submitFill() { try { const visitedOrders = [...state.visitHistory]; await api(`/api/public-survey/${state.survey.shortId}/responses`, { method: 'POST', body: JSON.stringify({ answers: state.answers, visitedOrders }) }); $('#filler').innerHTML = '<div class="empty">提交成功，感谢你的回答。</div>'; toast('问卷已提交', 'success'); } catch (error) { toast(error.message, 'error'); } }
 
 if (surveyRoute) openSurvey(decodeURIComponent(surveyRoute[1])); else if (state.token) loadDashboard().catch(logout);
+}

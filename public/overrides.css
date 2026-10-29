@@ -1,5 +1,6 @@
 /* A view state must always win over layout styles such as .auth-pane { display: grid }. */
-.app-view[hidden] {
+.app-view[hidden],
+[hidden] {
   display: none !important;
 }
 
@@ -43,6 +44,27 @@
 .rule-operands:empty { display: none; }
 
 .share-area { margin-top: 12px; }
+.template-list { display: grid; gap: 8px; }
+.inline-filter { display: inline-flex; align-items: center; gap: 7px; margin: 0; color: #66736e; font-size: 12px; }
+.inline-filter select { min-width: 140px; }
+.template-history { margin-top: 16px; padding-top: 16px; border-top: 1px solid #e6ebe7; }
+.history-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 12px; border-left: 3px solid #69a47e; background: #f7faf8; }
+.history-detail-button { display: grid; gap: 4px; min-width: 0; padding: 0; border: 0; background: transparent; color: #263831; text-align: left; cursor: pointer; font: inherit; }
+.history-detail-button:hover strong { color: #176c50; }
+.history-detail { margin-top: 10px; padding: 12px 14px; border: 1px solid #dfe6e1; background: #fff; }
+.history-detail h3 { margin: 0 0 10px; font-size: 14px; }
+.history-detail dl { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 6px 12px; margin: 0; font-size: 13px; }
+.history-detail dt { color: #66736e; }
+.history-detail dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.template-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: 12px 14px; border: 1px solid #dfe6e1; border-radius: 5px; background: #fff; }
+.template-row h3 { margin: 0 0 5px; font-size: 14px; }
+.template-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.library-create { display: grid; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid #e6ebe7; }
+.template-picker { margin-top: 16px; padding: 16px; border: 1px solid #dfe6e1; border-radius: 5px; background: #f8faf8; }
+.template-picker h3 { margin: 0; font-size: 15px; }
+.bank-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; margin: 14px 0; }
+.bank-list { display: grid; gap: 6px; margin: 8px 0 16px; }
+.bank-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid #e2e8e4; border-radius: 4px; background: #f7f9f7; color: #42544b; font-size: 13px; }
 .share-url { display: block; max-width: 100%; overflow-x: auto; padding: 7px 8px; border: 1px solid #e2e8e4; border-radius: 4px; background: #f7f9f7; color: #456158; font-size: 12px; }
 .share-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
 .case-panel .section-head { align-items: flex-start; }
@@ -83,6 +105,8 @@
 .filler-footer button { min-width: 96px; }
 
 @media (max-width: 700px) {
+  .template-row { grid-template-columns: 1fr; }
+  .bank-form { grid-template-columns: 1fr; }
   .question-top,
   .rule-card {
     grid-template-columns: 1fr 1fr;

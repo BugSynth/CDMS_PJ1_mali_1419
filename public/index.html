@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>问卷工作台</title>
   <link rel="stylesheet" href="/styles.css">
-  <link rel="stylesheet" href="/overrides.css?v=20261022-9">
+  <link rel="stylesheet" href="/overrides.css?v=20261029-9">
 </head>
 <body>
   <header class="topbar"><a class="brand" href="/">问卷工作台</a><div id="identity"></div></header>
@@ -19,11 +19,36 @@
     </form>
   </section>
   <section class="app-view" id="dashboard" hidden>
-    <div class="page-heading"><div><span class="eyebrow">个人工作台</span><h1>我的问卷</h1></div><div class="button-row"><button class="quiet" id="casesToggle" type="button">功能验证</button><button class="primary" id="createToggle">＋ 新建问卷</button></div></div>
+    <div class="page-heading"><div><span class="eyebrow">个人工作台</span><h1>我的问卷</h1></div><div class="button-row"><button class="quiet" id="libraryToggle" type="button">题目库</button><button class="quiet" id="surveyLibraryToggle" type="button">问卷库</button><button class="quiet" id="casesToggle" type="button">功能验证</button><button class="primary" id="createToggle">＋ 新建问卷</button></div></div>
     <section class="workspace case-panel" id="casePanel" hidden>
-      <div class="section-head"><div><h2>功能验证用例</h2><p class="muted">检查真实接口和填写页面。每项结果均提供可展开的输入、响应及断言证据；结束后自动清理验证数据。</p></div><button class="primary" id="runCases" type="button">运行验证</button></div>
+      <div class="section-head"><div><h2>功能验证用例</h2><p class="muted">检查真实接口和填写页面。每项结果均提供可展开的输入、响应及断言证据；测试数据会保留到手动删除。</p></div><div class="button-row"><button class="primary" id="runCases" type="button">运行验证</button><button class="danger" id="deleteCases" type="button" hidden>一键删除测试数据</button></div></div>
       <div id="caseResults" class="case-results"><p class="muted">尚未运行验证。</p></div>
       <div id="caseBrowser" class="case-browser" aria-live="polite"></div>
+    </section>
+    <section class="workspace library-panel" id="libraryPanel" hidden>
+      <div class="section-head"><div><h2>题目库</h2><p class="muted"></p></div><button class="quiet" id="libraryClose" type="button">关闭</button></div>
+      <form id="bankForm" class="bank-form"><label>新建题库<input name="name" required maxlength="200" placeholder="例如：通用人口信息"></label><button class="quiet" type="submit">创建题库</button></form><div id="bankList" class="bank-list"></div>
+      <form id="templateForm" class="library-create">
+        <div class="form-grid"><label>题目<input name="prompt" required maxlength="5000" placeholder="例如：你的年龄"></label><label>题型<select name="type"><option value="text">文本填空</option><option value="number">数字填空</option><option value="single_choice">单选</option><option value="multiple_choice">多选</option></select></label></div>
+        <label>版本名称<input name="versionName" maxlength="100" placeholder="例如：适用于 2026 年调查"></label>
+        <label>归属题库<select name="bankId" id="templateBank"><option value="">未归类</option></select></label>
+        <label id="templateOptionsField" hidden>选项（每行一个）<textarea name="options" rows="3" placeholder="选项一&#10;选项二"></textarea></label>
+        <div id="templateFillValidation" class="form-grid"><label>最少字符<input name="minLength" type="number" min="0"></label><label>最多字符<input name="maxLength" type="number" min="0"></label><label id="templateIntegerField" hidden>只能整数<select name="integerOnly"><option value="false">否</option><option value="true">是</option></select></label></div>
+        <div id="templateChoiceValidation" class="form-grid" hidden><label>最少选择<input name="minSelections" type="number" min="0"></label><label>最多选择<input name="maxSelections" type="number" min="0"></label></div>
+        <label class="check-row"><input name="required" type="checkbox"> 必答</label>
+        <button class="primary" type="submit" id="templateSubmit">保存为新题目</button><button class="quiet" type="button" id="templateCancelEdit" hidden>取消编辑</button><p class="message" id="templateMessage"></p>
+      </form>
+      <div class="section-head"><h2>可用题目</h2><div class="button-row"><label class="inline-filter">题库<select id="templateBankFilter"><option value="">全部题库</option><option value="__uncategorized">未归类</option></select></label><button class="quiet" id="refreshTemplates" type="button">刷新</button></div></div>
+      <div id="templateList" class="template-list"></div>
+      <section id="templateHistory" class="template-history" hidden>
+        <div class="section-head"><h2>版本历史</h2><button class="quiet" id="templateHistoryClose" type="button">关闭</button></div>
+        <div id="templateHistoryList" class="template-list"></div>
+        <article id="templateHistoryDetail" class="history-detail" hidden></article>
+      </section>
+    </section>
+    <section class="workspace library-panel" id="surveyLibraryPanel" hidden>
+      <div class="section-head"><div><h2>问卷库</h2><p class="muted">保存整份问卷结构作为模板，使用时复制为新的问卷。</p></div><button class="quiet" id="surveyLibraryClose" type="button">关闭</button></div>
+      <div id="surveyTemplateList" class="template-list"></div>
     </section>
     <section id="builder" class="workspace" hidden>
       <div class="section-head"><h2>问卷设置</h2><button class="quiet" id="builderClose">取消</button></div>
@@ -31,8 +56,9 @@
         <div class="form-grid"><label>问卷标题<input name="title" required maxlength="200" placeholder="例如：校园出行调查"></label><label>截止时间<input name="closesAt" type="datetime-local"></label></div>
         <label>说明<textarea name="description" rows="2" placeholder="填写问卷说明"></textarea></label>
         <div class="check-row"><label><input name="allowAnonymous" type="checkbox"> 匿名保存回答（不记录填写账号）</label><label><input name="allowMultipleResponses" type="checkbox"> 允许重复提交</label></div>
-        <div class="section-head"><h2>题目 <span id="questionCount" class="muted">0</span></h2><div class="button-row"><button type="button" class="quiet" data-add="single_choice">＋ 单选</button><button type="button" class="quiet" data-add="multiple_choice">＋ 多选</button><button type="button" class="quiet" data-add="fill">＋ 填空</button></div></div>
+        <div class="section-head"><h2>题目 <span id="questionCount" class="muted">0</span></h2><div class="button-row"><button type="button" class="quiet" data-add="single_choice">＋ 单选</button><button type="button" class="quiet" data-add="multiple_choice">＋ 多选</button><button type="button" class="quiet" data-add="fill">＋ 填空</button><button type="button" class="quiet" id="pickTemplate">从题库添加</button></div></div>
         <div id="questionList" class="question-list"></div>
+        <section id="templatePicker" class="template-picker" hidden><div class="section-head"><h3>选择题库题目</h3><button type="button" class="quiet" id="closeTemplatePicker">关闭</button></div><p class="muted">选择一个题目版本加入当前问卷，加入后仍可在问卷中调整必答设置。</p><label class="inline-filter">题库<select id="templatePickerBankFilter"><option value="">全部题库</option><option value="__uncategorized">未归类</option></select></label><div id="templatePickerList" class="template-list"></div></section>
         <div class="section-head"><h2>跳转规则</h2><button type="button" class="quiet" id="addRule">＋ 添加规则</button></div>
         <div id="ruleList" class="rule-list"></div>
         <div class="form-footer"><span class="muted">规则按优先级顺序匹配，未匹配时进入下一题。</span><button type="submit" class="primary" name="status" value="draft">保存草稿</button><button type="submit" class="primary publish" name="status" value="published">发布问卷</button></div>
@@ -44,6 +70,6 @@
   <section class="app-view" id="results" hidden></section>
   <div id="toast" role="status" class="toast" hidden></div>
   </main>
-  <script src="/app.js?v=20261022-11"></script>
+  <script src="/app.js?v=20261029-33"></script>
 </body>
 </html>

@@ -4,7 +4,7 @@ const { MongoClient } = require('mongodb');
 
 const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'questionnaire_system';
-const collections = ['answers', 'responses', 'jump_rules', 'questions', 'surveys', 'users'];
+const collections = ['answers', 'responses', 'jump_rules', 'questions', 'surveys', 'survey_templates', 'question_templates', 'question_banks', 'users'];
 
 async function main() {
   const client = new MongoClient(uri);

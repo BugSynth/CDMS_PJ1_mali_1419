@@ -55,6 +55,92 @@ const definitions = [
     ]
   },
   {
+    name: 'question_banks',
+    validator: {
+      $jsonSchema: {
+        bsonType: 'object',
+        required: ['ownerId', 'name', 'createdAt', 'updatedAt'],
+        properties: {
+          ownerId: objectId,
+          name: { ...string, minLength: 1, maxLength: 200 },
+          nameKey: { ...string, minLength: 1, maxLength: 200 },
+          description: { ...string, maxLength: 2000 },
+          visibility: { enum: ['private', 'shared'] },
+          sharedWith: { bsonType: 'array', items: objectId },
+          createdAt: date,
+          updatedAt: date
+        }
+      }
+    },
+    indexes: [
+      { key: { ownerId: 1, nameKey: 1 }, options: { unique: true, partialFilterExpression: { nameKey: { $exists: true } }, name: 'owner_question_bank_name_unique' } },
+      { key: { ownerId: 1, updatedAt: -1 }, options: { name: 'owner_question_bank_list' } },
+      { key: { sharedWith: 1, updatedAt: -1 }, options: { name: 'shared_question_bank_list' } }
+    ]
+  },
+  {
+    name: 'survey_templates',
+    validator: {
+      $jsonSchema: {
+        bsonType: 'object',
+        required: ['ownerId', 'title', 'questions', 'jumpRules', 'createdAt', 'updatedAt'],
+        properties: {
+          ownerId: objectId,
+          title: { ...string, minLength: 1, maxLength: 200 },
+          description: { ...string, maxLength: 5000 },
+          allowAnonymous: { bsonType: 'bool' },
+          allowMultipleResponses: { bsonType: 'bool' },
+          questions: { bsonType: 'array', minItems: 1 },
+          jumpRules: { bsonType: 'array' },
+          createdAt: date,
+          updatedAt: date
+        }
+      }
+    },
+    indexes: [
+      { key: { ownerId: 1, updatedAt: -1 }, options: { name: 'owner_survey_template_list' } },
+      { key: { title: 1 }, options: { name: 'survey_template_title_search' } }
+    ]
+  },
+  {
+    name: 'question_templates',
+    validator: {
+      $jsonSchema: {
+        bsonType: 'object',
+        required: ['ownerId', 'rootQuestionId', 'version', 'question', 'createdAt', 'updatedAt'],
+        properties: {
+          ownerId: objectId,
+          rootQuestionId: objectId,
+          derivedFromId: objectId,
+          version: { bsonType: 'int', minimum: 1 },
+          bankId: objectId,
+          question: {
+            bsonType: 'object',
+            required: ['type', 'prompt', 'required', 'validation'],
+            properties: {
+              type: { enum: ['single_choice', 'multiple_choice', 'text', 'number'] },
+              prompt: { ...string, minLength: 1, maxLength: 5000 },
+              required: { bsonType: 'bool' },
+              options: { bsonType: 'array' },
+              validation: { bsonType: 'object' }
+            }
+          },
+          visibility: { enum: ['private', 'shared'] },
+          sharedWith: { bsonType: 'array', items: objectId },
+          status: { enum: ['active', 'archived'] },
+          createdAt: date,
+          updatedAt: date
+        }
+      }
+    },
+    indexes: [
+      { key: { rootQuestionId: 1, version: 1 }, options: { unique: true, name: 'question_template_version_unique' } },
+      { key: { ownerId: 1, updatedAt: -1 }, options: { name: 'owner_question_template_list' } },
+      { key: { sharedWith: 1, updatedAt: -1 }, options: { name: 'shared_question_template_list' } },
+      { key: { bankId: 1, updatedAt: -1 }, options: { name: 'bank_question_template_list' } }
+    ]
+  },
+  {
     name: 'questions',
     validator: {
       $jsonSchema: {
@@ -79,6 +165,8 @@ const definitions = [
             }
           },
           validation: { bsonType: 'object' },
+          sourceTemplateId: objectId,
+          sourceTemplateVersion: { bsonType: 'int', minimum: 1 },
           createdAt: date,
           updatedAt: date
         }
@@ -132,7 +220,6 @@ const definitions = [
         properties: {
           surveyId: objectId,
           respondentId: { bsonType: ['objectId', 'null'] },
-          submissionKey: string,
           isAnonymous: { bsonType: 'bool' },
           visitedQuestionIds: { bsonType: 'array', items: objectId },
           status: { enum: ['in_progress', 'submitted', 'abandoned'] },
@@ -145,8 +232,7 @@ const definitions = [
     },
     indexes: [
       { key: { surveyId: 1, status: 1, submittedAt: -1 }, options: { name: 'survey_submission_list' } },
-      { key: { surveyId: 1, respondentId: 1, startedAt: -1 }, options: { name: 'respondent_response_list' } },
-      { key: { surveyId: 1, submissionKey: 1 }, options: { unique: true, sparse: true, name: 'one_submission_per_respondent_when_limited' } }
+      { key: { surveyId: 1, respondentId: 1, startedAt: -1 }, options: { name: 'respondent_response_list' } }
     ]
   },
   {
@@ -189,6 +275,9 @@ async function main() {
   try {
     await client.connect();
     const db = client.db(databaseName);
+    const banks = db.collection('question_banks');
+    const legacyBanks = await banks.find({ nameKey: { $exists: false } }, { projection: { _id: 1, name: 1 } }).toArray();
+    for (const bank of legacyBanks) await banks.updateOne({ _id: bank._id }, { $set: { nameKey: String(bank.name).trim().toLocaleLowerCase('zh-CN') } });
     for (const definition of definitions) await ensureCollection(db, definition);
     console.log(`Initialized ${databaseName}: ${definitions.map(({ name }) => name).join(', ')}`);
   } finally {

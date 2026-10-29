@@ -7,6 +7,7 @@
     "db:init": "node db/init.js",
     "db:reset": "node scripts/reset-database.js",
     "verify": "node scripts/verify-system.js",
+    "verify:phase2": "node scripts/verify-phase2.js",
     "start": "node server.js"
   },
   "dependencies": {

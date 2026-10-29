@@ -11,9 +11,30 @@ const SECRET = process.env.APP_SECRET || 'local-development-secret-change-me';
 const client = new MongoClient(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017');
 const dbName = process.env.MONGODB_DB || 'questionnaire_system';
 const publicDir = path.join(__dirname, 'public');
+const MAX_TEMPLATE_VERSIONS = 10;
+
+async function normalizeTemplateChains(templates, rows) {
+  const chains = new Map();
+  for (const row of rows) {
+    const key = row.rootQuestionId?.toString();
+    if (!key) continue;
+    if (!chains.has(key)) chains.set(key, []);
+    chains.get(key).push(row);
+  }
+  await Promise.all([...chains.values()].map(async (chain) => {
+    const current = chain.find((item) => item.currentVersionId) || chain.reduce((latest, item) => item.version > latest.version ? item : latest, chain[0]);
+    const currentId = current.currentVersionId || current._id;
+    const missingNames = chain.filter((item) => !item.versionName);
+    await Promise.all([
+      templates.updateMany({ rootQuestionId: current.rootQuestionId, $or: [{ currentVersionId: { $exists: false } }, { currentVersionId: null }] }, { $set: { currentVersionId: currentId } }),
+      ...missingNames.map((item) => templates.updateOne({ _id: item._id }, { $set: { versionName: `版本 ${item.version}` } }))
+    ]);
+    chain.forEach((item) => { item.currentVersionId = currentId; if (!item.versionName) item.versionName = `版本 ${item.version}`; });
+  }));
+}
 
 function send(res, status, data) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': 'same-origin' });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': 'same-origin' });
   res.end(JSON.stringify(data));
 }
 
@@ -21,10 +42,6 @@ function tokenFor(userId) {
   const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + 7 * 86400000 })).toString('base64url');
   const signature = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
   return `${payload}.${signature}`;
-}
-
-function responseLimitKey(surveyId, userId) {
-  return crypto.createHmac('sha256', SECRET).update(`response-limit:${surveyId}:${userId}`).digest('base64url');
 }
 
 function userFrom(req) {
@@ -159,6 +176,51 @@ function publishCycleError(questions, rules) {
   return `Cannot publish: jump rules may loop (${labels.join(' -> ')})`;
 }
 
+function templateQuestion(input) {
+  const type = input?.type;
+  if (!['single_choice', 'multiple_choice', 'text', 'number'].includes(type)) throw new Error('题型无效');
+  const prompt = String(input.prompt || '').trim();
+  if (!prompt) throw new Error('题干不能为空');
+  const question = {
+    type,
+    prompt,
+    required: Boolean(input.required),
+    validation: input.validation && typeof input.validation === 'object' ? input.validation : {}
+  };
+  if (type === 'single_choice' || type === 'multiple_choice') {
+    if (!Array.isArray(input.options) || input.options.length < 2) throw new Error('选择题至少需要两个选项');
+    question.options = input.options.map((option, index) => ({ key: String(option.key || `option_${index + 1}`), text: String(option.text || '').trim(), order: index + 1 })).filter((option) => option.text);
+    if (question.options.length < 2) throw new Error('选择题至少需要两个有效选项');
+  }
+  return question;
+}
+
+async function canUseTemplate(db, template, userId) {
+  return template && (template.ownerId.equals(userId) || template.sharedWith?.some((id) => id.equals(userId)) || (template.bankId && await db.collection('question_banks').findOne({ _id: template.bankId, sharedWith: userId })));
+}
+
+async function questionsFromInput(db, input, userId, surveyId, now) {
+  if (Array.isArray(input.libraryQuestionIds) && input.libraryQuestionIds.length) {
+    const ids = input.libraryQuestionIds.map((id) => new ObjectId(id));
+    const templates = await db.collection('question_templates').find({ _id: { $in: ids } }).toArray();
+    if (templates.length !== ids.length || !(await Promise.all(templates.map((template) => canUseTemplate(db, template, userId)))).every(Boolean)) throw new Error('题库中存在无权使用的题目');
+    const byId = new Map(templates.map((template) => [template._id.toString(), template]));
+    return ids.map((id, index) => {
+      const template = byId.get(id.toString());
+      return { ...template.question, surveyId, order: index + 1, sourceTemplateId: template._id, sourceTemplateVersion: template.version, createdAt: now, updatedAt: now };
+    });
+  }
+  if (!Array.isArray(input.questions)) return [];
+  return input.questions.map((question, index) => ({
+    ...question,
+    ...(question.sourceTemplateId ? { sourceTemplateId: new ObjectId(question.sourceTemplateId) } : {}),
+    surveyId,
+    order: index + 1,
+    createdAt: now,
+    updatedAt: now
+  }));
+}
+
 async function route(req, res) {
   const db = client.db(dbName);
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -189,6 +251,227 @@ async function route(req, res) {
   const authenticatedUser = await db.collection('users').findOne({ _id: userId }, { projection: { _id: 1 } });
   if (!authenticatedUser) return send(res, 401, { error: '登录状态已失效，请重新登录' });
 
+  if (parts[0] === 'api' && parts[1] === 'question-banks') {
+    const banks = db.collection('question_banks');
+    if (req.method === 'GET' && parts.length === 2) {
+      const rows = await banks.find({ $or: [{ ownerId: userId }, { sharedWith: userId }] }).sort({ updatedAt: -1 }).toArray();
+      return send(res, 200, rows.map(clean));
+    }
+    if (req.method === 'POST' && parts.length === 2) {
+      const input = await bodyOf(req);
+      const name = String(input.name || '').trim();
+      if (!name) return send(res, 400, { error: '题库名称不能为空' });
+      const nameKey = name.toLocaleLowerCase('zh-CN');
+      if (await banks.findOne({ ownerId: userId, $or: [{ nameKey }, { name }] }, { projection: { _id: 1 } })) return send(res, 409, { error: '题库名称已存在，请使用其他名称' });
+      const now = new Date();
+      const bank = { ownerId: userId, name, nameKey, description: String(input.description || ''), visibility: input.visibility === 'shared' ? 'shared' : 'private', sharedWith: [], createdAt: now, updatedAt: now };
+      try { const result = await banks.insertOne(bank); bank._id = result.insertedId; }
+      catch (error) { if (error.code === 11000) return send(res, 409, { error: '题库名称已存在，请使用其他名称' }); throw error; }
+      return send(res, 201, clean(bank));
+    }
+    if (req.method === 'POST' && parts.length === 4 && parts[3] === 'share') {
+      const bank = await banks.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!bank) return send(res, 404, { error: '题库不存在' });
+      const input = await bodyOf(req);
+      const target = await db.collection('users').findOne({ username: String(input.username || '').trim() }, { projection: { _id: 1 } });
+      if (!target) return send(res, 404, { error: '用户不存在' });
+      await banks.updateOne({ _id: bank._id }, { $addToSet: { sharedWith: target._id }, $set: { visibility: 'shared', updatedAt: new Date() } });
+      return send(res, 200, { shared: true });
+    }
+    if (req.method === 'DELETE' && parts.length === 3) {
+      const bank = await banks.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!bank) return send(res, 404, { error: '题库不存在或无权删除' });
+      const used = await db.collection('question_templates').countDocuments({ bankId: bank._id });
+      if (used) return send(res, 409, { error: `题库仍包含 ${used} 个题目版本，请先移除题目归属` });
+      await banks.deleteOne({ _id: bank._id });
+      return send(res, 200, { deleted: true });
+    }
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'survey-templates') {
+    const collection = db.collection('survey_templates');
+    if (req.method === 'GET' && parts.length === 2) {
+      const rows = await collection.find({ ownerId: userId }).sort({ updatedAt: -1 }).toArray();
+      return send(res, 200, rows.map(clean));
+    }
+    if (req.method === 'POST' && parts.length === 2) {
+      const input = await bodyOf(req);
+      const source = await db.collection('surveys').findOne({ shortId: String(input.sourceShortId || ''), ownerId: userId, status: 'draft' });
+      if (!source) return send(res, 404, { error: '只能将自己拥有的草稿保存到问卷库' });
+      const [questions, rules] = await Promise.all([
+        db.collection('questions').find({ surveyId: source._id }).sort({ order: 1 }).toArray(),
+        db.collection('jump_rules').find({ surveyId: source._id }).toArray()
+      ]);
+      if (!questions.length) return send(res, 400, { error: '问卷至少需要一道题才能保存为模板' });
+      const now = new Date();
+      const template = {
+        ownerId: userId,
+        title: String(input.title || source.title).trim().slice(0, 200),
+        description: source.description || '',
+        allowAnonymous: source.allowAnonymous,
+        allowMultipleResponses: source.allowMultipleResponses,
+        questions: questions.map((question) => {
+          const { _id, surveyId, createdAt, updatedAt, order, ...snapshot } = question;
+          return snapshot;
+        }),
+        jumpRules: rules.map((rule) => ({
+          sourceOrder: questions.findIndex((question) => question._id.equals(rule.sourceQuestionId)) + 1,
+          targetOrder: questions.findIndex((question) => question._id.equals(rule.targetQuestionId)) + 1,
+          condition: rule.condition,
+          priority: rule.priority,
+          enabled: rule.enabled
+        })),
+        createdAt: now,
+        updatedAt: now
+      };
+      if (!template.title) return send(res, 400, { error: '问卷模板名称不能为空' });
+      const result = await collection.insertOne(template);
+      template._id = result.insertedId;
+      return send(res, 201, clean(template));
+    }
+    if (req.method === 'DELETE' && parts.length === 3) {
+      const result = await collection.deleteOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      return result.deletedCount ? send(res, 200, { deleted: true }) : send(res, 404, { error: '问卷模板不存在或无权删除' });
+    }
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'question-templates') {
+    const templates = db.collection('question_templates');
+    if (req.method === 'GET' && parts.length === 2) {
+      const sharedBanks = await db.collection('question_banks').find({ sharedWith: userId }, { projection: { _id: 1 } }).toArray();
+      const rows = await templates.find({ $or: [{ ownerId: userId }, { sharedWith: userId }, { bankId: { $in: sharedBanks.map((bank) => bank._id) } }] }).sort({ rootQuestionId: 1, version: -1 }).toArray();
+      await normalizeTemplateChains(templates, rows);
+      const visibleBanks = await db.collection('question_banks').find({ $or: [{ ownerId: userId }, { sharedWith: userId }] }, { projection: { _id: 1, name: 1 } }).toArray();
+      const bankNames = new Map(visibleBanks.map((bank) => [bank._id.toString(), bank.name]));
+      return send(res, 200, rows.map((row) => ({ ...clean(row), bankName: row.bankId ? bankNames.get(row.bankId.toString()) || '已归属题库' : '未归类' })));
+    }
+    if (req.method === 'POST' && parts.length === 2) {
+      const input = await bodyOf(req); const now = new Date();
+      let question;
+      try { question = templateQuestion(input.question || input); } catch (error) { return send(res, 400, { error: error.message }); }
+      const rootQuestionId = new ObjectId();
+      const template = { _id: new ObjectId(), ownerId: userId, rootQuestionId, version: 1, versionName: String(input.versionName || '初始版本').trim().slice(0, 100), question, ...(input.bankId ? { bankId: new ObjectId(input.bankId) } : {}), visibility: input.visibility === 'shared' ? 'shared' : 'private', sharedWith: [], status: 'active', currentVersionId: null, createdAt: now, updatedAt: now };
+      template.currentVersionId = template._id;
+      await templates.insertOne(template);
+      return send(res, 201, clean(template));
+    }
+    if (req.method === 'POST' && parts.length === 4 && parts[3] === 'versions') {
+      const base = await templates.findOne({ _id: new ObjectId(parts[2]) });
+      if (!base || !base.ownerId.equals(userId)) return send(res, 404, { error: '题目版本不存在或无权修改' });
+      const input = await bodyOf(req); let question;
+      try { question = templateQuestion(input.question || input); } catch (error) { return send(res, 400, { error: error.message }); }
+      const count = await templates.countDocuments({ rootQuestionId: base.rootQuestionId });
+      if (count >= MAX_TEMPLATE_VERSIONS) return send(res, 409, { error: `同一题目最多保留 ${MAX_TEMPLATE_VERSIONS} 个版本，请先删除旧版本` });
+      const current = base.currentVersionId ? await templates.findOne({ _id: base.currentVersionId }) : await templates.find({ rootQuestionId: base.rootQuestionId }).sort({ version: -1 }).limit(1).next();
+      const maxVersion = await templates.find({ rootQuestionId: base.rootQuestionId }).sort({ version: -1 }).limit(1).next();
+      const now = new Date();
+      const next = { _id: new ObjectId(), ownerId: userId, rootQuestionId: base.rootQuestionId, derivedFromId: current?._id || base._id, version: (maxVersion?.version || 0) + 1, versionName: String(input.versionName || '未命名版本').trim().slice(0, 100), question, ...(input.bankId || base.bankId ? { bankId: new ObjectId(input.bankId || base.bankId) } : {}), visibility: input.visibility === 'shared' ? 'shared' : (base.visibility || 'private'), sharedWith: base.sharedWith || [], status: 'active', currentVersionId: null, createdAt: now, updatedAt: now };
+      await templates.insertOne(next);
+      await templates.updateMany({ rootQuestionId: base.rootQuestionId }, { $set: { currentVersionId: next._id } });
+      return send(res, 201, clean(next));
+    }
+    if (req.method === 'POST' && parts.length === 4 && parts[3] === 'clone') {
+      const base = await templates.findOne({ _id: new ObjectId(parts[2]) });
+      if (!base || !base.ownerId.equals(userId)) return send(res, 404, { error: '题目版本不存在或无权复制' });
+      const input = await bodyOf(req); let question;
+      try { question = templateQuestion(input.question || base.question); } catch (error) { return send(res, 400, { error: error.message }); }
+      const now = new Date();
+      const cloned = { _id: new ObjectId(), ownerId: userId, rootQuestionId: new ObjectId(), version: 1, versionName: String(input.versionName || '初始版本').trim().slice(0, 100), derivedFromTemplateId: base._id, derivedFromVersion: base.version, question, ...(input.bankId || base.bankId ? { bankId: new ObjectId(input.bankId || base.bankId) } : {}), visibility: input.visibility === 'shared' ? 'shared' : (base.visibility || 'private'), sharedWith: [], status: 'active', currentVersionId: null, createdAt: now, updatedAt: now };
+      cloned.currentVersionId = cloned._id;
+      await templates.insertOne(cloned);
+      return send(res, 201, clean(cloned));
+    }
+    if (req.method === 'GET' && parts.length === 4 && parts[3] === 'history') {
+      const template = await templates.findOne({ _id: new ObjectId(parts[2]) });
+      if (!await canUseTemplate(db, template, userId)) return send(res, 404, { error: '题目版本不存在或无权查看' });
+      const history = await templates.find({ rootQuestionId: template.rootQuestionId }).sort({ version: 1 }).toArray();
+      const versionById = new Map(history.map((item) => [item._id.toString(), item.version]));
+       const currentId = template.currentVersionId || history.reduce((latest, item) => item.version > latest.version ? item : latest, history[0])?._id;
+       return send(res, 200, {
+        rootQuestionId: template.rootQuestionId.toString(),
+         currentVersionId: currentId?.toString(),
+         versions: history.map((item) => ({ ...clean(item), current: item._id.equals(currentId), derivedFromVersion: item.derivedFromId ? versionById.get(item.derivedFromId.toString()) || null : null }))
+      });
+    }
+    if (req.method === 'POST' && parts.length === 4 && parts[3] === 'restore') {
+      const source = await templates.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!source) return send(res, 404, { error: '题目版本不存在或无权恢复' });
+      await templates.updateMany({ rootQuestionId: source.rootQuestionId }, { $set: { currentVersionId: source._id, updatedAt: new Date() } });
+      return send(res, 200, { ...clean(source), current: true, rolledBackToVersion: source.version });
+    }
+    if (req.method === 'POST' && parts.length === 4 && parts[3] === 'share') {
+      const template = await templates.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!template) return send(res, 404, { error: '题目版本不存在' });
+      const input = await bodyOf(req); const target = await db.collection('users').findOne({ username: String(input.username || '').trim() }, { projection: { _id: 1 } });
+      if (!target) return send(res, 404, { error: '用户不存在' });
+      await templates.updateOne({ _id: template._id }, { $addToSet: { sharedWith: target._id }, $set: { visibility: 'shared', updatedAt: new Date() } });
+      return send(res, 200, { shared: true });
+    }
+    if (req.method === 'DELETE' && parts.length === 3) {
+      const template = await templates.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!template) return send(res, 404, { error: '题目版本不存在或无权删除' });
+      const allVersions = await templates.find({ rootQuestionId: template.rootQuestionId }).toArray();
+      const currentId = template.currentVersionId || allVersions.reduce((latest, item) => item.version > latest.version ? item : latest, allVersions[0])?._id;
+      if (template._id.equals(currentId)) return send(res, 409, { error: '不能删除当前版本，请先回溯到其他版本' });
+      const [usage] = await Promise.all([
+        db.collection('questions').countDocuments({ sourceTemplateId: template._id }),
+      ]);
+      if (usage) return send(res, 409, { error: `该版本已被 ${usage} 个问卷快照使用，不能删除` });
+      await templates.deleteOne({ _id: template._id });
+      return send(res, 200, { deleted: true });
+    }
+    if (req.method === 'DELETE' && parts.length === 4 && parts[3] === 'chain') {
+      const template = await templates.findOne({ _id: new ObjectId(parts[2]), ownerId: userId });
+      if (!template) return send(res, 404, { error: '题目不存在或无权删除' });
+      const chain = await templates.find({ rootQuestionId: template.rootQuestionId }, { projection: { _id: 1 } }).toArray();
+      const ids = chain.map((item) => item._id);
+      const usage = await db.collection('questions').countDocuments({ sourceTemplateId: { $in: ids } });
+      if (usage) return send(res, 409, { error: `该题目已有 ${usage} 个问卷快照在使用，不能删除` });
+      await templates.deleteMany({ _id: { $in: ids } });
+      return send(res, 200, { deleted: true, deletedVersions: ids.length });
+    }
+    if (req.method === 'GET' && parts.length === 4 && parts[3] === 'usage') {
+      const template = await templates.findOne({ _id: new ObjectId(parts[2]) });
+      if (!await canUseTemplate(db, template, userId)) return send(res, 404, { error: '题目版本不存在或无权查看' });
+      const version = url.searchParams.get('version');
+      const chain = await templates.find({ rootQuestionId: template.rootQuestionId }, { projection: { _id: 1, version: 1 } }).toArray();
+      const selected = version ? chain.find((item) => item.version === Number(version)) : null;
+      if (version && !selected) return send(res, 404, { error: '题目版本不存在' });
+      const sourceFilter = { sourceTemplateId: version ? selected._id : { $in: chain.map((item) => item._id) } };
+      const uses = await db.collection('questions').aggregate([
+        { $match: sourceFilter },
+        { $lookup: { from: 'surveys', localField: 'surveyId', foreignField: '_id', as: 'survey' } },
+        { $unwind: '$survey' },
+        { $project: { surveyId: 1, order: 1, sourceTemplateVersion: 1, surveyTitle: '$survey.title', surveyStatus: '$survey.status', ownerId: '$survey.ownerId' } }
+      ]).toArray();
+      return send(res, 200, { template: clean(template), usages: uses.map(clean) });
+    }
+  }
+
+  if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'question-stats' && parts[2]) {
+    const template = await db.collection('question_templates').findOne({ _id: new ObjectId(parts[2]) });
+    if (!await canUseTemplate(db, template, userId)) return send(res, 404, { error: '题目版本不存在或无权查看' });
+    const version = url.searchParams.get('version');
+    const chain = await db.collection('question_templates').find({ rootQuestionId: template.rootQuestionId }, { projection: { _id: 1, version: 1 } }).toArray();
+    const selected = version ? chain.find((item) => item.version === Number(version)) : null;
+    if (version && !selected) return send(res, 404, { error: '题目版本不存在' });
+    const questionFilter = { sourceTemplateId: version ? selected._id : { $in: chain.map((item) => item._id) } };
+    const snapshots = await db.collection('questions').find(questionFilter, { projection: { _id: 1, type: 1, prompt: 1, options: 1, sourceTemplateVersion: 1 } }).toArray();
+    const ids = snapshots.map((question) => question._id);
+    const answers = await db.collection('answers').aggregate([
+      { $match: { questionId: { $in: ids } } },
+      { $lookup: { from: 'responses', localField: 'responseId', foreignField: '_id', as: 'response' } },
+      { $unwind: '$response' }, { $match: { 'response.status': 'submitted' } },
+      { $project: { value: 1, questionType: 1 } }
+    ]).toArray();
+    const values = answers.map((answer) => answer.value);
+    const numbers = values.filter((value) => typeof value === 'number');
+    const counts = new Map();
+    for (const value of values.flatMap((value) => Array.isArray(value) ? value : [value])) counts.set(String(value), (counts.get(String(value)) || 0) + 1);
+    const canViewRaw = template.ownerId.equals(userId);
+    return send(res, 200, { template: clean(template), versions: [...new Set(snapshots.map((question) => question.sourceTemplateVersion))], responseCount: answers.length, values: canViewRaw || template.question.type !== 'text' ? values : [], average: numbers.length ? numbers.reduce((sum, value) => sum + value, 0) / numbers.length : null, optionCounts: [...counts.entries()].map(([key, count]) => ({ key, count })) });
+  }
+
   if (req.method === 'GET' && parts.join('/') === 'api/surveys') {
     const rows = await db.collection('surveys').find({ ownerId: userId }).sort({ createdAt: -1 }).toArray();
     return send(res, 200, rows.map(clean));
@@ -196,7 +479,7 @@ async function route(req, res) {
 
   if (req.method === 'POST' && parts.join('/') === 'api/surveys') {
     const input = await bodyOf(req);
-    if (!input.title?.trim() || !Array.isArray(input.questions) || input.questions.length === 0) return send(res, 400, { error: '问卷标题和至少一道题为必填' });
+    if (!input.title?.trim() || (!Array.isArray(input.questions) && !Array.isArray(input.libraryQuestionIds))) return send(res, 400, { error: '问卷标题和至少一道题为必填' });
     const now = new Date();
     const survey = {
       ownerId: userId,
@@ -214,7 +497,8 @@ async function route(req, res) {
     let created;
     let questionIds = [];
     try {
-      const questions = input.questions.map((q, index) => ({ ...q, surveyId: null, order: index + 1, createdAt: now, updatedAt: now }));
+      const questions = await questionsFromInput(db, input, userId, null, now);
+      if (!questions.length) return send(res, 400, { error: '问卷至少需要一道题' });
       for (const rule of input.jumpRules || []) {
         if (!Number.isInteger(rule.sourceOrder) || !Number.isInteger(rule.targetOrder) || rule.sourceOrder < 1 || rule.targetOrder < 1 || rule.sourceOrder > questions.length || rule.targetOrder > questions.length) throw new Error('跳转规则题号无效');
       }
@@ -263,18 +547,13 @@ async function route(req, res) {
       await db.collection('surveys').deleteOne({ _id: survey._id, ownerId: userId });
       return send(res, 200, { deleted: true, removed: { answers: answers.deletedCount, responses: responses.deletedCount, jumpRules: rules.deletedCount, questions: questions.deletedCount } });
     }
-    if (req.method === 'POST' && survey && parts[3] === 'close' && parts.length === 4) {
-      if (survey.status !== 'published') return send(res, 409, { error: '只能关闭已发布问卷' });
-      const now = new Date();
-      await db.collection('surveys').updateOne({ _id: survey._id, ownerId: userId, status: 'published' }, { $set: { status: 'closed', closedAt: now, updatedAt: now } });
-      return send(res, 200, { closed: true, closedAt: now });
-    }
     if (req.method === 'PUT' && survey && parts.length === 3) {
       if (survey.status !== 'draft') return send(res, 409, { error: '只能编辑草稿问卷' });
       const input = await bodyOf(req);
-      if (!input.title?.trim() || !Array.isArray(input.questions) || input.questions.length === 0) return send(res, 400, { error: '问卷标题和至少一道题为必填' });
+      if (!input.title?.trim() || (!Array.isArray(input.questions) && !Array.isArray(input.libraryQuestionIds))) return send(res, 400, { error: '问卷标题和至少一道题为必填' });
       const now = new Date();
-      const questions = input.questions.map((question, index) => ({ ...question, surveyId: survey._id, order: index + 1, createdAt: now, updatedAt: now }));
+      const questions = await questionsFromInput(db, input, userId, survey._id, now);
+      if (!questions.length) return send(res, 400, { error: '问卷至少需要一道题' });
       for (const rule of input.jumpRules || []) {
         if (!Number.isInteger(rule.sourceOrder) || !Number.isInteger(rule.targetOrder) || rule.sourceOrder < 1 || rule.targetOrder < 1 || rule.sourceOrder > questions.length || rule.targetOrder > questions.length) return send(res, 400, { error: '跳转规则题号无效' });
       }
@@ -362,8 +641,8 @@ async function route(req, res) {
   if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'public-survey' && parts[2] && parts[3] === 'responses') {
     const survey = await db.collection('surveys').findOne({ shortId: parts[2], status: 'published' });
     if (!survey || (survey.closesAt && survey.closesAt <= new Date())) return send(res, 404, { error: '问卷不存在或已关闭' });
-    const submissionKey = survey.allowMultipleResponses ? null : responseLimitKey(survey._id.toString(), userId.toString());
-    if (submissionKey && await db.collection('responses').findOne({ surveyId: survey._id, submissionKey, status: 'submitted' })) return send(res, 409, { error: '你已提交过这份问卷' });
+    const user = await db.collection('users').findOne({ _id: userId }, { projection: { passwordHash: 0 } });
+    if (!survey.allowAnonymous && !survey.allowMultipleResponses && user && await db.collection('responses').findOne({ surveyId: survey._id, respondentId: userId, status: 'submitted' })) return send(res, 409, { error: '你已提交过这份问卷' });
     const input = await bodyOf(req);
     const questions = await db.collection('questions').find({ surveyId: survey._id }).sort({ order: 1 }).toArray();
     if (!Array.isArray(input.visitedOrders)) return send(res, 400, { error: '缺少答题访问路径' });
@@ -399,7 +678,7 @@ async function route(req, res) {
     if (expectedOrders.length !== visitedOrders.length || expectedOrders.some((order, index) => order !== visitedOrders[index])) return send(res, 400, { error: '答题路径与问卷跳转规则不一致' });
     if (Object.keys(answers).some((order) => !expectedOrders.includes(Number(order)))) return send(res, 400, { error: '答案中包含未访问题目' });
     const now = new Date();
-    const response = { surveyId: survey._id, respondentId: survey.allowAnonymous ? null : userId, ...(submissionKey ? { submissionKey } : {}), isAnonymous: survey.allowAnonymous, visitedQuestionIds: expectedOrders.map((order) => questions.find((q) => q.order === order)._id), status: 'submitted', startedAt: now, submittedAt: now, createdAt: now, updatedAt: now };
+    const response = { surveyId: survey._id, respondentId: survey.allowAnonymous ? null : userId, isAnonymous: survey.allowAnonymous, visitedQuestionIds: expectedOrders.map((order) => questions.find((q) => q.order === order)._id), status: 'submitted', startedAt: now, submittedAt: now, createdAt: now, updatedAt: now };
     const answerDocs = questions.filter((q) => {
       const value = answers[q.order];
       return expectedOrders.includes(q.order) && value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0);
@@ -412,7 +691,6 @@ async function route(req, res) {
     } catch (error) {
       if (response._id) await db.collection('answers').deleteMany({ responseId: response._id });
       if (response._id) await db.collection('responses').deleteOne({ _id: response._id });
-      if (error.code === 11000 && submissionKey) return send(res, 409, { error: '你已提交过这份问卷' });
       throw error;
     }
     return send(res, 201, { submitted: true });
